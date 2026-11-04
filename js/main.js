@@ -7,7 +7,7 @@ import { refreshExit, exitLabel, exitLocation, onExitChange } from './location.j
 import { getPref, setPref } from './store.js';
 import { relayBase, playbackURL } from './net.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.2';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hhmm = (t) => new Date(t).toLocaleTimeString('fr-CH', { hour: '2-digit', minute: '2-digit' });
@@ -397,9 +397,14 @@ let rotation = 'none';     // none | rot90 | rotm90
 let hideTimer = null;
 let panelTimer = null;
 
+// Taille réelle de l'écran pour le paysage simulé : on mesure la zone du lecteur (plein écran),
+// window.innerHeight étant plus court que l'écran dans une web app installée.
 function setViewportVars() {
-  document.documentElement.style.setProperty('--vw', `${window.innerWidth}px`);
-  document.documentElement.style.setProperty('--vh', `${window.innerHeight}px`);
+  const r = P.hidden ? null : P.getBoundingClientRect();
+  const w = Math.max(r?.width || 0, window.innerWidth, document.documentElement.clientWidth);
+  const h = Math.max(r?.height || 0, window.innerHeight, document.documentElement.clientHeight);
+  document.documentElement.style.setProperty('--vw', `${w}px`);
+  document.documentElement.style.setProperty('--vh', `${h}px`);
 }
 setViewportVars();
 window.addEventListener('resize', () => {
@@ -420,6 +425,7 @@ function applyLayout() {
 
 function setRotation(r) {
   rotation = r;
+  setViewportVars();
   applyLayout();
 }
 
@@ -514,9 +520,13 @@ video.addEventListener('pause', () => { renderPlayer(); showControls(false); });
 
 function showControls(autoHide = true) {
   controls.classList.remove('off');
+  rotor.classList.remove('chrome-off');
   if (autoHide) scheduleHide(); else clearTimeout(hideTimer);
 }
-function hideControls() { controls.classList.add('off'); }
+function hideControls() {
+  controls.classList.add('off');
+  rotor.classList.add('chrome-off');   // barre du haut masquée aussi (portrait)
+}
 function scheduleHide() {
   clearTimeout(hideTimer);
   hideTimer = setTimeout(() => {
@@ -539,6 +549,8 @@ function rotateOrFullscreen() {
 }
 
 P.addEventListener('click', (e) => {
+  // Barre du haut masquée : un toucher la fait réapparaître sans déclencher de bouton
+  if (rotor.classList.contains('chrome-off') && e.target.closest('.pbar')) { showControls(); return; }
   const act = e.target.closest('[data-act]')?.dataset.act;
   if (!act) return;
   switch (act) {
@@ -576,7 +588,7 @@ function renderPanel() {
 function openPanel() {
   panel.hidden = false;
   stage.classList.add('panel-open');
-  hideControls();
+  controls.classList.add('off');
   renderPanel();
   closePanelSoon(8000);
 }
