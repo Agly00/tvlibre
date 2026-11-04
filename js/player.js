@@ -303,8 +303,9 @@ export class Player {
     set('pause', () => this.video.pause());
     set('nexttrack', () => this.zapHandler?.(1));
     set('previoustrack', () => this.zapHandler?.(-1));
-    set('seekbackward', null);
-    set('seekforward', null);
+    // iOS affiche souvent ±10 s plutôt que ⏮ ⏭ : en direct, on s'en sert aussi pour zapper
+    set('seekbackward', () => this.zapHandler?.(-1));
+    set('seekforward', () => this.zapHandler?.(1));
   }
 
   updateMediaSession(subtitle) {

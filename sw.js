@@ -1,6 +1,7 @@
-// Cache local de l'application : elle démarre sans réseau ni GitHub.
-// Seuls les fichiers de l'app sont mis en cache ; les listes et les flux passent toujours par le réseau.
-const VERSION = 'tvlibre-1.0.3';
+// Fichiers de l'app : réseau d'abord (toujours la dernière version publiée),
+// copie locale si le réseau est indisponible (démarrage hors ligne ou sans GitHub).
+// Les listes et les flux ne passent jamais par ce cache.
+const VERSION = 'tvlibre-1.0.7';
 const FILES = [
   './',
   'index.html',
@@ -23,7 +24,8 @@ const FILES = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES)));
+  self.skipWaiting(); // la nouvelle version prend la main tout de suite
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES.map((f) => new Request(f, { cache: 'reload' })))));
 });
 
 self.addEventListener('activate', (e) => {
@@ -36,10 +38,18 @@ self.addEventListener('activate', (e) => {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== self.location.origin) return;
-  // Copie locale d'abord, réseau en secours
-  e.respondWith(caches.match(e.request, { ignoreSearch: true }).then((hit) => hit || fetch(e.request)));
-});
-
-self.addEventListener('message', (e) => {
-  if (e.data === 'skipWaiting') self.skipWaiting();
+  e.respondWith((async () => {
+    const cache = await caches.open(VERSION);
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 4000);
+      const res = await fetch(e.request, { cache: 'no-cache', signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.ok) cache.put(e.request, res.clone());
+      return res;
+    } catch {
+      const hit = await cache.match(e.request, { ignoreSearch: true });
+      return hit || Response.error();
+    }
+  })());
 });

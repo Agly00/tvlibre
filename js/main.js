@@ -7,7 +7,7 @@ import { refreshExit, exitLabel, exitLocation, onExitChange } from './location.j
 import { getPref, setPref } from './store.js';
 import { relayBase, playbackURL } from './net.js';
 
-const VERSION = '1.0.3';
+const VERSION = '1.0.7';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hhmm = (t) => new Date(t).toLocaleTimeString('fr-CH', { hour: '2-digit', minute: '2-digit' });
@@ -272,7 +272,10 @@ function settingsHTML() {
   </div>
   <p class="note">Un flux en échec est remis à l'essai après 30 min, 3 h, 24 h puis 72 h. Un flux géobloqué n'est jamais mis en quarantaine à cause de ta localisation.</p>
 
-  <div class="card" style="margin-top:18px"><button class="item action" data-a="reload">Recharger les listes</button></div>
+  <div class="card" style="margin-top:18px">
+    <button class="item action" data-a="reload">Recharger les listes</button>
+    <button class="item action" data-a="force-update">Forcer la mise à jour de l'app</button>
+  </div>
   <p class="note">TV Libre ${VERSION}</p>`;
 }
 
@@ -329,6 +332,15 @@ function bindSettings(body) {
       case 'guide-refresh': refreshGuide(true); break;
       case 'react-all': H.reactivateAll(); refreshSettings(); break;
       case 'reload': closeSheet(); await reloadCatalog(); break;
+      case 'force-update': {
+        // Vide la copie locale de l'app (pas les réglages ni les favoris) et recharge depuis GitHub
+        try {
+          for (const r of (await navigator.serviceWorker?.getRegistrations?.()) || []) await r.unregister();
+          for (const k of (await caches?.keys?.()) || []) await caches.delete(k);
+        } catch { /* ignoré */ }
+        location.reload();
+        break;
+      }
     }
   });
 }
@@ -421,21 +433,105 @@ function applyLayout() {
   rotor.classList.toggle('rot90', rotation === 'rot90');
   rotor.classList.toggle('rotm90', rotation === 'rotm90');
   rotor.classList.toggle('landscape', isLandscapeView());
+  // Téléphone déjà en vrai paysage (rotation déverrouillée) : rien à simuler
+  const rb = $('[data-act=rotate]');
+  if (rb) rb.hidden = realLandscape() && rotation === 'none';
   requestAnimationFrame(updateBand);
 }
 
 /** Largeur des bandes noires de chaque côté de l'image (paysage), pour y caler les commandes */
+// Paysage simulé : l'heure et le flou d'iOS occupent ~100 pt côté Dynamic Island.
+// On décale l'image pour laisser cette marge de ce côté, en prenant sur la bande opposée.
+const ISLAND_CLEAR = 100;
+
 function updateBand() {
-  let band = 0;
+  let left = 0, right = 0, vl = 0, vr = 0;
   if (isLandscapeView() && !stage.classList.contains('fill')) {
     const W = stage.clientWidth;          // dimensions avant rotation : repère de l'image
     const H = stage.clientHeight;
     const ar = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9;
-    band = Math.max(0, (W - Math.min(W, H * ar)) / 2);
+    const free = Math.max(0, W - Math.min(W, H * ar)); // noir total disponible
+    left = right = free / 2;
+    if (rotation !== 'none' && free > 0) {
+      const islandSide = Math.min(free, Math.max(free / 2, ISLAND_CLEAR));
+      const shift = Math.round(2 * islandSide - free);           // décalage de la zone vidéo
+      if (rotation === 'rot90') { vl = shift; left = islandSide; right = free - islandSide; }
+      else { vr = shift; right = islandSide; left = free - islandSide; }
+    }
   }
-  rotor.style.setProperty('--band', `${Math.round(band)}px`);
+  rotor.style.setProperty('--bandL', `${Math.round(left)}px`);
+  rotor.style.setProperty('--bandR', `${Math.round(right)}px`);
+  stage.style.setProperty('--vl', `${vl}px`);
+  stage.style.setProperty('--vr', `${vr}px`);
 }
 video.addEventListener('loadedmetadata', updateBand);
+
+// ---------- Sous-titres (pistes fournies par le flux : WebVTT ou sous-titrage intégré) ----------
+
+function subtitleTracks() {
+  return [...video.textTracks].filter((t) => t.kind === 'subtitles' || t.kind === 'captions');
+}
+function trackLabel(t) {
+  const lang = t.language ? new Intl.DisplayNames(['fr'], { type: 'language' }).of(t.language.split('-')[0]) : '';
+  const base = t.label || lang || 'Piste';
+  return base + (t.kind === 'captions' ? ' (malentendants)' : '');
+}
+/** Applique le choix mémorisé : null = désactivés, sinon langue préférée */
+function applySubtitlePref() {
+  const want = getPref('subs', null);
+  const tracks = subtitleTracks();
+  let chosen = null;
+  if (want) chosen = tracks.find((t) => (t.language || '').startsWith(want)) || tracks.find((t) => t.kind === 'captions') || tracks[0];
+  for (const t of tracks) t.mode = t === chosen ? 'showing' : 'disabled';
+  if (hasLegacyCC() && !tracks.length) video.webkitClosedCaptionsVisible = !!want;
+  updateSubsButton();
+}
+// Sous-titrage télé intégré au flux (CEA-608) : Safari le signale à part de la liste des pistes
+const hasLegacyCC = () => !!video.webkitHasClosedCaptions;
+const legacyCCOn = () => !!video.webkitClosedCaptionsVisible;
+
+function updateSubsButton() {
+  const b = $('#btn-subs');
+  if (!b) return;
+  const tracks = subtitleTracks();
+  b.hidden = tracks.length === 0 && !hasLegacyCC();
+  b.classList.toggle('on', tracks.some((t) => t.mode === 'showing') || legacyCCOn());
+}
+video.textTracks.addEventListener?.('addtrack', () => setTimeout(applySubtitlePref, 50));
+video.addEventListener('loadedmetadata', () => setTimeout(applySubtitlePref, 300));
+video.addEventListener('playing', updateSubsButton);
+video.textTracks.addEventListener?.('removetrack', updateSubsButton);
+video.textTracks.addEventListener?.('change', updateSubsButton);
+
+function openSubtitles() {
+  const tracks = subtitleTracks();
+  const legacy = hasLegacyCC() && !tracks.length;
+  const active = tracks.find((t) => t.mode === 'showing') || (legacy && legacyCCOn() ? 'cc' : null);
+  openModal('Sous-titres', `
+    <div class="card" style="margin-top:12px">
+      <button class="item ${!active ? 'current' : ''}" data-ti="-1"><span class="txt">${!active ? '✓ ' : ''}Désactivés</span></button>
+      ${tracks.map((t, i) => `<button class="item ${t === active ? 'current' : ''}" data-ti="${i}"><span class="txt">${t === active ? '✓ ' : ''}${esc(trackLabel(t))}</span></button>`).join('')}
+      ${legacy ? `<button class="item ${active === 'cc' ? 'current' : ''}" data-ti="cc"><span class="txt">${active === 'cc' ? '✓ ' : ''}Sous-titrage du flux</span></button>` : ''}
+    </div>
+    <p class="note">Ton choix est retenu pour les autres chaînes quand la même langue existe.</p>`, (body) => {
+    body.addEventListener('click', (e) => {
+      const ti = e.target.closest('[data-ti]')?.dataset.ti;
+      if (ti === undefined) return;
+      if (legacy) {
+        video.webkitClosedCaptionsVisible = ti === 'cc';
+        setPref('subs', ti === 'cc' ? 'fr' : null);
+        updateSubsButton();
+        closeModal();
+        return;
+      }
+      const t = tracks[+ti];
+      setPref('subs', t ? (t.language || 'und').split('-')[0] : null);
+      for (const x of tracks) x.mode = x === t ? 'showing' : 'disabled';
+      updateSubsButton();
+      closeModal();
+    });
+  });
+}
 video.addEventListener('resize', updateBand);
 
 function setRotation(r) {
@@ -458,6 +554,7 @@ function openPlayer(list, index) {
 }
 
 function closePlayer() {
+  if (navigator.serviceWorker?.controller && window.__pendingReload) { location.reload(); return; }
   player.stop();
   ctx = null;
   P.hidden = true;
@@ -506,6 +603,7 @@ function renderPlayer() {
   P.querySelectorAll('.p-sub').forEach((el) => { el.textContent = sub.text; el.className = 'p-sub ' + sub.cls; });
   $('.big-play').classList.toggle('playing', !video.paused);
   $('#btn-airplay').hidden = !player.airplayAvailable;
+  updateSubsButton();
   const { now } = G.nowNext(player.channel.id);
   player.updateMediaSession(now ? `${hhmm(now.start)} ${now.title}` : undefined);
 
@@ -552,14 +650,10 @@ function toggleControls() {
   controls.classList.contains('off') ? showControls() : hideControls();
 }
 
+// Paysage simulé uniquement (jamais le plein écran natif d'iOS)
 function rotateOrFullscreen() {
   if (rotation !== 'none') { setRotation('none'); return; }
-  if (realLandscape()) {
-    // Rotation du système déverrouillée : plein écran natif, intégral
-    if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
-    else stage.requestFullscreen?.();
-    return;
-  }
+  if (realLandscape()) return;
   setRotation(getPref('rotation', 'rot90'));
 }
 
@@ -575,6 +669,7 @@ P.addEventListener('click', (e) => {
     case 'play': player.togglePlay(); break;
     case 'airplay': player.showAirPlay(); break;
     case 'rotate': rotateOrFullscreen(); break;
+    case 'subs': openSubtitles(); return;
     case 'retry': player.retryCurrent(); break;
     case 'retry-all': player.retryAll(); break;
     case 'auto': player.unlockAndContinue(); break;
@@ -801,14 +896,18 @@ document.addEventListener('visibilitychange', async () => {
 
 // Fonctionnement hors ligne et mises à jour
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  // Nouvelle version publiée : elle prend la main et l'app se recharge d'elle-même (sauf pendant la lecture)
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloaded) return;
+    reloaded = true;
+    if (!ctx) location.reload();
+    else { window.__pendingReload = true; toast('Nouvelle version installée : elle s\'appliquera à la fermeture du lecteur.'); }
+  });
   navigator.serviceWorker.register('sw.js').then((reg) => {
-    reg.addEventListener('updatefound', () => {
-      const nw = reg.installing;
-      nw?.addEventListener('statechange', () => {
-        if (nw.state === 'installed' && navigator.serviceWorker.controller) {
-          toast('Nouvelle version disponible : touche pour l\'installer.', 0, () => location.reload());
-        }
-      });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') reg.update().catch(() => {});
     });
   }).catch(() => {});
 }
