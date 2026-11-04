@@ -186,7 +186,11 @@ video::cue { font-size: 0.9em; background: rgba(0, 0, 0, 0.6); }
   background: #000; pointer-events: none; text-align: center;
 }
 .apcard .logo { width: 140px; height: 92px; }
-.apcard .ap-icon { width: 34px; height: 34px; color: var(--accent); margin-top: 8px; }
+/* Ordre d'affichage : carton < commandes < bandeau, liste, erreur, fenêtres */
+.apcard { z-index: 0; }
+.controls { z-index: 1; }
+.zap, .panel, .perror, .modal { z-index: 2; }
+#btn-airplay.on { color: var(--accent); }
 .ap-zap .zap { display: none; }
 .zap {
   position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); pointer-events: none;

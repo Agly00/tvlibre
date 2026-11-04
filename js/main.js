@@ -7,7 +7,7 @@ import { refreshExit, exitLabel, exitLocation, onExitChange } from './location.j
 import { getPref, setPref } from './store.js';
 import { relayBase, playbackURL } from './net.js';
 
-const VERSION = '1.0.11';
+const VERSION = '1.0.12';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hhmm = (t) => new Date(t).toLocaleTimeString('fr-CH', { hour: '2-digit', minute: '2-digit' });
@@ -579,10 +579,11 @@ let airplayCardTimer = null;
 // Carton AirPlay : logo de la chaîne + icône de diffusion en bleu, à la place de la vidéo locale.
 // Affiché pendant toute la diffusion AirPlay, et pendant la reconnexion au changement de chaîne.
 let apZapping = false;
+let apCardFor = null;   // chaîne déjà dessinée : on ne redessine pas (le logo ne clignote plus)
 function renderAirplayCard(ch) {
-  const card = $('#apcard');
-  if (!ch) return;
-  card.innerHTML = `<span class="logo">${logoHTML(ch)}</span><svg class="ap-icon"><use href="#i-airplay"/></svg>`;
+  if (!ch || apCardFor === ch.id) return;
+  apCardFor = ch.id;
+  $('#apcard').innerHTML = `<span class="logo">${logoHTML(ch)}</span>`;
 }
 function syncAirplayCard() {
   const on = !!ctx && !player.error && (player.wireless || apZapping);
@@ -641,6 +642,7 @@ function renderPlayer() {
   P.querySelectorAll('.p-sub').forEach((el) => { el.textContent = sub.text; el.className = 'p-sub ' + sub.cls; });
   $('.big-play').classList.toggle('playing', !video.paused);
   $('#btn-airplay').hidden = !player.airplayAvailable;
+  $('#btn-airplay').classList.toggle('on', player.wireless);   // bleu pendant la diffusion
   updateSubsButton();
   const { now } = G.nowNext(player.channel.id);
   player.updateMediaSession(now ? `${hhmm(now.start)} ${now.title}` : undefined);
