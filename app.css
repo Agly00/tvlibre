@@ -179,6 +179,16 @@ video::cue { font-size: 0.9em; background: rgba(0, 0, 0, 0.6); }
 .landscape .pbar { display: none; }
 .landscape .pill { display: flex; }
 
+/* Changement de chaîne en AirPlay : pas d'image locale, un carton à la place */
+.stage.ap-zap video { opacity: 0; }
+.apcard {
+  position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+  background: #000; pointer-events: none; text-align: center;
+}
+.apcard .logo { width: 120px; height: 80px; }
+.apcard b { font-size: 22px; }
+.apcard small { color: var(--accent); font-size: 14px; }
+.ap-zap .zap { display: none; }
 .zap {
   position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); pointer-events: none;
   padding: 10px 20px; border-radius: 24px; font-size: 20px; font-weight: 700;
@@ -193,7 +203,7 @@ video::cue { font-size: 0.9em; background: rgba(0, 0, 0, 0.6); }
   background: rgba(22, 22, 24, 0.72); -webkit-backdrop-filter: blur(22px) saturate(1.4); backdrop-filter: blur(22px) saturate(1.4);
   animation: slide 0.22s ease-out;
 }
-.landscape .panel { width: calc(var(--sl) + 300px); }
+.landscape .panel { width: calc(max(var(--sl), var(--islandL, 0px)) + 300px); padding-left: max(var(--sl), var(--islandL, 0px)); }
 @keyframes slide { from { transform: translateX(-100%); } }
 .panel, .modal-body { touch-action: auto; }
 .panel .row { border-bottom: 0; padding: 8px 14px; min-height: 50px; }

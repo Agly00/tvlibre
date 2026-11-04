@@ -1,7 +1,7 @@
 // Fichiers de l'app : réseau d'abord (toujours la dernière version publiée),
 // copie locale si le réseau est indisponible (démarrage hors ligne ou sans GitHub).
 // Les listes et les flux ne passent jamais par ce cache.
-const VERSION = 'tvlibre-1.0.8';
+const VERSION = 'tvlibre-1.0.9';
 const FILES = [
   './',
   'index.html',

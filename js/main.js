@@ -7,7 +7,7 @@ import { refreshExit, exitLabel, exitLocation, onExitChange } from './location.j
 import { getPref, setPref } from './store.js';
 import { relayBase, playbackURL } from './net.js';
 
-const VERSION = '1.0.8';
+const VERSION = '1.0.9';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hhmm = (t) => new Date(t).toLocaleTimeString('fr-CH', { hour: '2-digit', minute: '2-digit' });
@@ -461,6 +461,7 @@ function updateBand() {
   }
   rotor.style.setProperty('--bandL', `${Math.round(left)}px`);
   rotor.style.setProperty('--bandR', `${Math.round(right)}px`);
+  rotor.style.setProperty('--islandL', rotation === 'rot90' ? `${ISLAND_CLEAR}px` : '0px');
   stage.style.setProperty('--vl', `${vl}px`);
   stage.style.setProperty('--vr', `${vr}px`);
 }
@@ -553,7 +554,9 @@ function openPlayer(list, index) {
   renderPlayer();
 }
 
+function closePlayerCleanup() { hideAirplayCard(); }
 function closePlayer() {
+  closePlayerCleanup();
   if (navigator.serviceWorker?.controller && window.__pendingReload) { location.reload(); return; }
   player.stop();
   ctx = null;
@@ -569,9 +572,33 @@ function zap(delta) {
   selectIndex((ctx.index + delta + ctx.list.length) % ctx.list.length);
 }
 
+// ---------- Transition en AirPlay ----------
+// Safari relance la session AirPlay à chaque changement de flux : on cache la vidéo locale
+// et on affiche un carton jusqu'à ce que la télé reprenne.
+let airplayCardTimer = null;
+function showAirplayCard(ch) {
+  const card = $('#apcard');
+  card.innerHTML = `<span class="logo">${logoHTML(ch)}</span><b>${esc(ch.name)}</b><small>Sur l'Apple TV…</small>`;
+  card.hidden = false;
+  stage.classList.add('ap-zap');
+  clearTimeout(airplayCardTimer);
+  airplayCardTimer = setTimeout(hideAirplayCard, 12000);
+}
+function hideAirplayCard() {
+  clearTimeout(airplayCardTimer);
+  $('#apcard').hidden = true;
+  stage.classList.remove('ap-zap');
+}
+player.on(() => {
+  if (stage.classList.contains('ap-zap') && player.wireless && player.succeeded) setTimeout(hideAirplayCard, 600);
+  if (stage.classList.contains('ap-zap') && player.error) hideAirplayCard();
+});
+
 function selectIndex(i) {
   if (!ctx || !ctx.list[i]) return;
   ctx.index = i;
+  const wasAirPlay = player.wireless;
+  if (wasAirPlay) showAirplayCard(ctx.list[i]);
   player.open(ctx.list[i]);
   const z = $('#zap');
   z.textContent = ctx.list[i].name;
