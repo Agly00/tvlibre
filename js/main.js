@@ -7,7 +7,7 @@ import { refreshExit, exitLabel, exitLocation, onExitChange } from './location.j
 import { getPref, setPref } from './store.js';
 import { relayBase, playbackURL } from './net.js';
 
-const VERSION = '1.0.10';
+const VERSION = '1.0.11';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hhmm = (t) => new Date(t).toLocaleTimeString('fr-CH', { hour: '2-digit', minute: '2-digit' });
@@ -625,7 +625,6 @@ player.setZapHandler(zap);
 function playerSub() {
   const ch = player.channel;
   if (!ch) return { text: '', cls: '' };
-  if (player.wireless) return { text: "Sur l'Apple TV", cls: 'wireless' };
   const { now } = G.nowNext(ch.id);
   const s = player.current;
   const i = s ? player.queue.indexOf(s) : -1;
