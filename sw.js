@@ -1,6 +1,6 @@
 // Cache local de l'application : elle démarre sans réseau ni GitHub.
 // Seuls les fichiers de l'app sont mis en cache ; les listes et les flux passent toujours par le réseau.
-const VERSION = 'tvlibre-1.0.2';
+const VERSION = 'tvlibre-1.0.3';
 const FILES = [
   './',
   'index.html',

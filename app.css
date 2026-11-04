@@ -129,7 +129,8 @@ textarea.field { min-height: 140px; font-family: ui-monospace, Menlo, monospace;
 
 .pbar {
   display: flex; align-items: center; gap: 6px;
-  padding: calc(var(--st) + 14px) calc(var(--sr) + 8px) 8px calc(var(--sl) + 6px);
+  /* sous la zone floutée qu'iOS dessine sous l'heure (≈ 88 pt) */
+  padding: calc(var(--st) + 32px) calc(var(--sr) + 8px) 8px calc(var(--sl) + 6px);
   transition: opacity 0.25s;
 }
 /* Portrait : la barre garde sa place (la vidéo ne bouge pas) mais s'efface avec les commandes */
@@ -155,7 +156,8 @@ textarea.field { min-height: 140px; font-family: ui-monospace, Menlo, monospace;
 
 .cbar {
   position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 4px;
-  padding: 20px calc(var(--sr) + 10px) calc(var(--sb) + 6px) calc(var(--sl) + 14px);
+  /* calée sur l'image : jamais dans les bandes noires ni sous l'encoche */
+  padding: 20px calc(max(var(--sr), var(--band, 0px)) + 12px) calc(var(--sb) + 6px) calc(max(var(--sl), var(--band, 0px)) + 16px);
   background: linear-gradient(transparent, rgba(0, 0, 0, 0.6));
 }
 .live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; letter-spacing: 0.4px; }

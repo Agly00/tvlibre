@@ -7,7 +7,7 @@ import { refreshExit, exitLabel, exitLocation, onExitChange } from './location.j
 import { getPref, setPref } from './store.js';
 import { relayBase, playbackURL } from './net.js';
 
-const VERSION = '1.0.2';
+const VERSION = '1.0.3';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hhmm = (t) => new Date(t).toLocaleTimeString('fr-CH', { hour: '2-digit', minute: '2-digit' });
@@ -421,7 +421,22 @@ function applyLayout() {
   rotor.classList.toggle('rot90', rotation === 'rot90');
   rotor.classList.toggle('rotm90', rotation === 'rotm90');
   rotor.classList.toggle('landscape', isLandscapeView());
+  requestAnimationFrame(updateBand);
 }
+
+/** Largeur des bandes noires de chaque côté de l'image (paysage), pour y caler les commandes */
+function updateBand() {
+  let band = 0;
+  if (isLandscapeView() && !stage.classList.contains('fill')) {
+    const W = stage.clientWidth;          // dimensions avant rotation : repère de l'image
+    const H = stage.clientHeight;
+    const ar = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : 16 / 9;
+    band = Math.max(0, (W - Math.min(W, H * ar)) / 2);
+  }
+  rotor.style.setProperty('--band', `${Math.round(band)}px`);
+}
+video.addEventListener('loadedmetadata', updateBand);
+video.addEventListener('resize', updateBand);
 
 function setRotation(r) {
   rotation = r;
@@ -753,6 +768,7 @@ function openDiagnostic() {
       clearTimeout(tapTimer);
       lastTap = 0;
       stage.classList.toggle('fill');   // double tap : ajusté / rempli
+      updateBand();
       return;
     }
     lastTap = now;
