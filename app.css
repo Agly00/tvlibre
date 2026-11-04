@@ -185,9 +185,8 @@ video::cue { font-size: 0.9em; background: rgba(0, 0, 0, 0.6); }
   position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
   background: #000; pointer-events: none; text-align: center;
 }
-.apcard .logo { width: 120px; height: 80px; }
-.apcard b { font-size: 22px; }
-.apcard small { color: var(--accent); font-size: 14px; }
+.apcard .logo { width: 140px; height: 92px; }
+.apcard .ap-icon { width: 34px; height: 34px; color: var(--accent); margin-top: 8px; }
 .ap-zap .zap { display: none; }
 .zap {
   position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); pointer-events: none;

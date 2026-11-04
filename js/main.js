@@ -7,7 +7,7 @@ import { refreshExit, exitLabel, exitLocation, onExitChange } from './location.j
 import { getPref, setPref } from './store.js';
 import { relayBase, playbackURL } from './net.js';
 
-const VERSION = '1.0.9';
+const VERSION = '1.0.10';
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const hhmm = (t) => new Date(t).toLocaleTimeString('fr-CH', { hour: '2-digit', minute: '2-digit' });
@@ -576,30 +576,42 @@ function zap(delta) {
 // Safari relance la session AirPlay à chaque changement de flux : on cache la vidéo locale
 // et on affiche un carton jusqu'à ce que la télé reprenne.
 let airplayCardTimer = null;
-function showAirplayCard(ch) {
+// Carton AirPlay : logo de la chaîne + icône de diffusion en bleu, à la place de la vidéo locale.
+// Affiché pendant toute la diffusion AirPlay, et pendant la reconnexion au changement de chaîne.
+let apZapping = false;
+function renderAirplayCard(ch) {
   const card = $('#apcard');
-  card.innerHTML = `<span class="logo">${logoHTML(ch)}</span><b>${esc(ch.name)}</b><small>Sur l'Apple TV…</small>`;
-  card.hidden = false;
-  stage.classList.add('ap-zap');
+  if (!ch) return;
+  card.innerHTML = `<span class="logo">${logoHTML(ch)}</span><svg class="ap-icon"><use href="#i-airplay"/></svg>`;
+}
+function syncAirplayCard() {
+  const on = !!ctx && !player.error && (player.wireless || apZapping);
+  if (on) renderAirplayCard(player.channel);
+  $('#apcard').hidden = !on;
+  stage.classList.toggle('ap-zap', on);
+}
+function showAirplayCard() {
+  apZapping = true;
+  syncAirplayCard();
   clearTimeout(airplayCardTimer);
   airplayCardTimer = setTimeout(hideAirplayCard, 12000);
 }
 function hideAirplayCard() {
   clearTimeout(airplayCardTimer);
-  $('#apcard').hidden = true;
-  stage.classList.remove('ap-zap');
+  apZapping = false;
+  syncAirplayCard();
 }
 player.on(() => {
-  if (stage.classList.contains('ap-zap') && player.wireless && player.succeeded) setTimeout(hideAirplayCard, 600);
-  if (stage.classList.contains('ap-zap') && player.error) hideAirplayCard();
+  if (apZapping && player.wireless && player.succeeded) { apZapping = false; clearTimeout(airplayCardTimer); }
+  syncAirplayCard();
 });
 
 function selectIndex(i) {
   if (!ctx || !ctx.list[i]) return;
   ctx.index = i;
   const wasAirPlay = player.wireless;
-  if (wasAirPlay) showAirplayCard(ctx.list[i]);
   player.open(ctx.list[i]);
+  if (wasAirPlay) showAirplayCard();
   const z = $('#zap');
   z.textContent = ctx.list[i].name;
   z.hidden = false;
