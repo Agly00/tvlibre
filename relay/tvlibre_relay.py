@@ -15,7 +15,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1118,6 +1118,21 @@ class Guard:
 
 GUARD = Guard()
 
+VPN_MTU = 1280   # la ligne ne laisse pas passer les gros paquets du tunnel à 1420 : le HTTPS se bloquait
+
+
+def mtu_keeper():
+    """Remet la taille de paquet du tunnel à chaque (re)connexion du VPN"""
+    path = "/sys/class/net/nordlynx/mtu"
+    while True:
+        try:
+            if os.path.exists(path) and int(open(path).read().strip()) > VPN_MTU:
+                sh(["ip", "link", "set", "nordlynx", "mtu", str(VPN_MTU)], timeout=10)
+                log("taille de paquet du VPN ramenée à", VPN_MTU)
+        except Exception as e:
+            log("mtu :", e)
+        time.sleep(3)
+
 
 def status():
     return {
@@ -1285,6 +1300,7 @@ def main():
     os.makedirs(RUN, exist_ok=True)
     threading.Thread(target=SESSIONS.reap, daemon=True).start()
     threading.Thread(target=GUARD.loop, daemon=True).start()
+    threading.Thread(target=mtu_keeper, daemon=True).start()
     srv = Server(("0.0.0.0", PORT), Handler)
     log("TV Libre relais %s sur le port %d" % (VERSION, PORT))
     srv.serve_forever()
