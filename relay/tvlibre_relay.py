@@ -15,7 +15,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1184,7 +1184,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/live/open":
                 return self.live_open(q["u"])
             if u.path == "/vod/open":
-                return self.vod_open(q["u"], q.get("ext", "mkv").lower())
+                return self.vod_open(q["u"], q.get("ext", "mkv").lower(), float(q.get("start", "0") or 0))
             if u.path == "/close":
                 SESSIONS.close(q.get("id", ""))
                 return self.js({"ok": True})
@@ -1228,7 +1228,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.js({"error": "le direct ne démarre pas"}, 504)
         return self.js({"id": sid, "url": "/s/%s/live.m3u8" % sid})
 
-    def vod_open(self, url, ext):
+    def vod_open(self, url, ext, start=0.0):
         self.note_upstream(url)
         if ext in ("mp4", "m4v", "mov"):
             STATS.reset("mp4 relayé tel quel par le Raspberry")
@@ -1237,10 +1237,12 @@ class Handler(BaseHTTPRequestHandler):
         if ext == "mkv":
             STATS.reset("mkv réemballé par le Raspberry")
             sid, s = SESSIONS.open("mkv", lambda sid: MKVSession(url))
+            s.start_offset = start
             return self.js({"id": sid, "url": "/s/%s/master.m3u8" % sid, "duration": s.duration})
         if ext == "ts":
             STATS.reset("ts découpé par le Raspberry")
             sid, s = SESSIONS.open("ts", lambda sid: TSSession(url))
+            s.start_offset = start
             return self.js({"id": sid, "url": "/s/%s/master.m3u8" % sid, "duration": s.duration})
         return self.js({"error": "format .%s non pris en charge" % ext}, 415)
 
@@ -1251,6 +1253,10 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(s, ProxySession):
             return self.proxy(s.url, head)
         body, ctype = s.get(name)
+        off = getattr(s, "start_offset", 0)
+        if off > 0 and name.endswith(".m3u8") and body.startswith(b"#EXTM3U\n"):
+            # Reprise : le lecteur commence directement à cette position
+            body = b"#EXTM3U\n" + ("#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n" % off).encode() + body[8:]
         rng = self.headers.get("Range")
         m = re.fullmatch(r"bytes=(\d+)-(\d*)", rng or "")
         if m and int(m.group(1)) < len(body):
