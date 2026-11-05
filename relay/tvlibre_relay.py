@@ -15,11 +15,12 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
-IDLE_STOP = 60          # s sans demande du lecteur : session arrêtée (libère la connexion du compte)
+IDLE_STOP = {"live": 120}   # s sans demande du lecteur : session arrêtée (libère la connexion du compte)
+IDLE_STOP_VOD = 6 * 3600     # film en pause : on garde la session (la télécommande peut rester des heures en pause)
 
 
 def log(*a):
@@ -1062,7 +1063,7 @@ class Sessions:
             time.sleep(10)
             now = time.time()
             with self.lock:
-                old = [k for k, v in self.items.items() if now - v[1] > IDLE_STOP]
+                old = [k for k, v in self.items.items() if now - v[1] > IDLE_STOP.get(v[2], IDLE_STOP_VOD)]
             for k in old:
                 log("session inactive fermée", k)
                 self.close(k)
