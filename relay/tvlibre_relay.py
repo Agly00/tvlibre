@@ -22,7 +22,7 @@ import collections, json, math, os, re, shutil, socket, struct, subprocess, sys,
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.5.4"
+VERSION = "1.5.5"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1287,6 +1287,12 @@ class TVSession:
         clip = LOGOS.get(self.logo) if filler else None
         if clip:
             self._append("logo_%d.ts" % gen, 1.0, clip, True)
+            # L'Apple TV ne démarre un direct qu'avec ~3 durées cibles (6 s) d'avance dans la liste : avec un seul
+            # logo, elle attendait plusieurs secondes en gardant l'ancienne chaîne à l'écran. 6 logos d'emblée :
+            # elle a de quoi démarrer tout de suite.
+            for _ in range(5):
+                self.fillers += 1
+                self._append("fill_%d.ts" % self.fillers, 1.0, clip, True)
         src = os.path.join(self.dir, "src%d" % gen)
         os.makedirs(src, exist_ok=True)
         # Niveau sonore égalisé d'une chaîne à l'autre : gain appris aux visionnages précédents,
