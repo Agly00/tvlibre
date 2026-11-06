@@ -22,7 +22,7 @@ import collections, json, math, os, re, shutil, socket, struct, subprocess, sys,
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -2535,12 +2535,17 @@ class Handler(BaseHTTPRequestHandler):
         self.note_upstream(url)
         STATS.reset("direct continu par le Raspberry (zapping sans coupure)")
         sid, s = SESSIONS.open("live", lambda sid: TVSession(sid, url, logo))
+        # Réponse immédiate dès que le logo de la chaîne est en tête : l'Apple TV l'affiche pendant que la chaîne
+        # démarre (le logo est répété chaque seconde), au lieu d'un écran noir de 2 à 5 s. Sans logo : on attend la chaîne.
+        with s.lock:
+            has_logo = any(e[0].startswith("logo_") for e in s.entries)
         t = time.time()
-        while time.time() - t < 20 and not s.ready():
+        while not has_logo and time.time() - t < 20 and not s.ready():
             time.sleep(0.3)
-        if not s.ready():
+        if not has_logo and not s.ready():
             SESSIONS.close(sid)
             return self.js({"error": "le direct ne démarre pas"}, 504)
+        zlog("  réponse à l'app après %.1f s" % (time.time() - t), "(logo d'abord)" if has_logo else "(chaîne prête)")
         return self.js({"id": sid, "url": "/s/%s/tv.m3u8" % sid})
 
     # Zapping continu (même adresse, l'Apple TV enchaîne) : coupé. L'Apple TV garde 15 à 30 s d'avance de l'ancienne
