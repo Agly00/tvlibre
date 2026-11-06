@@ -19,7 +19,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1271,6 +1271,7 @@ class Recorder:
             j = {"id": uuid.uuid4().hex[:10], "url": q["u"], "title": q.get("title", "Enregistrement"),
                  "channel": q.get("channel", ""), "start": float(q.get("start", "0") or 0),
                  "duration": float(q.get("duration", "0") or 0), "status": "en attente", "bytes": 0,
+                 "expires": float(q.get("expires", "0") or 0),
                  "created": time.time(), "error": None}
             self.jobs.append(j)
             self.save()
@@ -1344,12 +1345,42 @@ class Recorder:
             return out
 
     def next_job(self):
+        """Replay à enregistrer : celui qui sort du replay le plus tôt passe en premier"""
         with self.lock:
             self.load()
+            todo = [j for j in self.jobs if j["status"] in ("en attente", "en pause") and j.get("kind") != "live"]
+        todo.sort(key=lambda j: j.get("expires") or float("inf"))
+        return todo[0] if todo else None
+
+    def check_expiry(self):
+        """Replays qui sortent de la fenêtre du serveur : abandon si c'est trop tard, alerte si c'est proche"""
+        now = time.time()
+        changed = False
+        with self.lock:
             for j in self.jobs:
-                if j["status"] in ("en attente", "en pause") and j.get("kind") != "live":
-                    return j
-        return None
+                if j.get("kind") == "live" or j["status"] not in ("en attente", "en pause") or not j.get("expires"):
+                    j.pop("urgent", None)
+                    continue
+                if now >= j["expires"]:
+                    j["status"], j["error"] = "échec", "sorti du replay avant la fin de l'enregistrement"
+                    j.pop("urgent", None)
+                    changed = True
+                    try:
+                        os.remove(self.path(j["id"] + ".ts"))
+                    except OSError:
+                        pass
+                else:
+                    # Il faut à peu près la durée du programme pour l'enregistrer (débit du serveur), plus 15 min de marge
+                    urgent = j["expires"] - now < j.get("duration", 3600) * 1.15 + 900
+                    if urgent != bool(j.get("urgent")):
+                        j["urgent"] = urgent
+                        changed = True
+            if changed:
+                self.save()
+
+    def urgent(self):
+        with self.lock:
+            return [{"id": j["id"], "title": j["title"], "expires": j["expires"]} for j in self.jobs if j.get("urgent")]
 
     def due_live(self):
         now = time.time()
@@ -1378,6 +1409,7 @@ class Recorder:
                 if not STORAGE.ok:
                     self.loaded = False
                     continue
+                self.check_expiry()
                 live = self.due_live()
                 if live:                                  # le direct à enregistrer passe avant tout
                     SESSIONS.close_all()
@@ -1596,6 +1628,7 @@ def status():
         "storage": {"ok": STORAGE.ok, "free": STORAGE.free(), "total": STORAGE.total(), "error": STORAGE.error,
                     "recordings": RECORDER.summary() if STORAGE.ok else {}},
         "recording": RECORDER.recording_now() if STORAGE.ok else None,
+        "urgent": RECORDER.urgent() if STORAGE.ok else [],
         "wireguard": WG.describe(),
     }
 
