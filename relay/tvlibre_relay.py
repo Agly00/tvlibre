@@ -9,7 +9,8 @@ Le Raspberry joint le serveur IPTV à travers NordVPN et sert à l'iPhone et à 
   /s/<id>/<fichier>        fichiers d'une session
   /close?id=<id>           fin de session
   /probe?u=URL             le serveur accepte-t-il les plages d'octets (replay lisible comme un film) ?
-  /rec/add, /rec/list, /rec/delete?id=, /rec/file/<id>.ts   enregistrements sur la clé USB
+  /rec/add, /rec/schedule, /rec/list, /rec/stop?id=, /rec/delete?id=, /rec/file/<id>.ts   enregistrements (clé USB)
+  /busy                    l'iPhone lit en direct depuis la 5G : les enregistrements de replay se mettent en pause
 Une seule lecture à la fois vers le serveur (abonnement limité à une connexion).
 Bibliothèque standard Python uniquement, plus ffmpeg.
 """
@@ -17,7 +18,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1070,8 +1071,13 @@ class Sessions:
                 log("session inactive fermée", k)
                 self.close(k)
 
+    remote_busy_until = 0.0
+
     def busy_upstream(self):
-        """Une lecture utilise la connexion du compte (les enregistrements relus depuis la clé ne comptent pas)"""
+        """Une lecture utilise la connexion du compte (les enregistrements relus depuis la clé ne comptent pas),
+        ici ou sur l'iPhone hors de la maison (signalé par /busy)"""
+        if time.time() < self.remote_busy_until:
+            return True
         with self.lock:
             return any(v[2] != "local" for v in self.items.values())
 
@@ -1269,6 +1275,48 @@ class Recorder:
             self.save()
             return j
 
+    def schedule(self, q):
+        """Direct à enregistrer à l'heure de diffusion (2 min de marge avant, 5 min après)"""
+        if not STORAGE.ok:
+            raise IOError("pas de clé USB utilisable")
+        start, stop = float(q["start"]), float(q["stop"])
+        with self.lock:
+            self.load()
+            j = {"id": uuid.uuid4().hex[:10], "url": q["u"], "title": q.get("title", "Enregistrement"),
+                 "channel": q.get("channel", ""), "start": start, "duration": stop - start, "kind": "live",
+                 "rec_from": start - 120, "rec_to": stop + 300,
+                 "status": "programmé", "bytes": 0, "created": time.time(), "error": None}
+            self.jobs.append(j)
+            self.save()
+            return j
+
+    def stop(self, jid):
+        """Arrêt demandé : le direct garde ce qui est déjà enregistré, un replay en attente est retiré de la file"""
+        with self.lock:
+            self.load()
+            for j in self.jobs:
+                if j["id"] != jid:
+                    continue
+                if j["status"] in ("en cours", "programmé", "en attente", "en pause"):
+                    has = os.path.exists(self.path(jid + ".ts")) and os.path.getsize(self.path(jid + ".ts")) > (1 << 20)
+                    j["status"] = "terminé" if has else "arrêté"
+                    j["error"] = "arrêté avant la fin" if has else None
+            if self.current == jid:
+                self.current = None
+            self.save()
+
+    def recording_now(self):
+        with self.lock:
+            for j in self.jobs:
+                if j["status"] == "en cours":
+                    return {"id": j["id"], "title": j["title"], "channel": j.get("channel", ""),
+                            "kind": j.get("kind", "replay"), "until": j.get("rec_to")}
+        return None
+
+    def live_active(self):
+        r = self.recording_now()
+        return r if r and r["kind"] == "live" else None
+
     def delete(self, jid):
         with self.lock:
             self.load()
@@ -1298,8 +1346,23 @@ class Recorder:
         with self.lock:
             self.load()
             for j in self.jobs:
-                if j["status"] in ("en attente", "en pause"):
+                if j["status"] in ("en attente", "en pause") and j.get("kind") != "live":
                     return j
+        return None
+
+    def due_live(self):
+        now = time.time()
+        with self.lock:
+            self.load()
+            for j in self.jobs:
+                if j.get("kind") == "live" and j["status"] in ("programmé", "en cours"):
+                    if now >= j["rec_to"]:
+                        has = os.path.exists(self.path(j["id"] + ".ts"))
+                        j["status"] = "terminé" if has else "échec"
+                        j["error"] = None if has else "rien n'a été reçu"
+                        self.save()
+                    elif now >= j["rec_from"]:
+                        return j
         return None
 
     def set(self, j, **kw):
@@ -1313,6 +1376,11 @@ class Recorder:
             try:
                 if not STORAGE.ok:
                     self.loaded = False
+                    continue
+                live = self.due_live()
+                if live:                                  # le direct à enregistrer passe avant tout
+                    SESSIONS.close_all()
+                    self.run_live(live)
                     continue
                 if SESSIONS.busy_upstream():
                     self.idle_since = time.time()
@@ -1369,9 +1437,45 @@ class Recorder:
             if self.current == j["id"]:
                 self.current = None
 
+    def run_live(self, j):
+        """Enregistre le direct jusqu'à l'heure de fin ; reconnexion automatique en cas de coupure"""
+        f = self.path(j["id"] + ".ts")
+        self.current = j["id"]
+        self.set(j, status="en cours", error=None)
+        log("enregistrement du direct", j["title"])
+        try:
+            with open(f, "ab") as out:
+                while time.time() < j["rec_to"] and self.current == j["id"]:
+                    if STORAGE.free() < self.MIN_FREE:
+                        self.set(j, status="terminé", error="clé pleine : arrêté avant la fin")
+                        return
+                    try:
+                        r = http_get(j["url"], timeout=20)
+                        t = time.time()
+                        while time.time() < j["rec_to"] and self.current == j["id"]:
+                            chunk = r.read(188 * 1000)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            now = time.time()
+                            STATS.add(len(chunk), now - t)
+                            t = now
+                        r.close()
+                    except Exception as e:
+                        log("direct interrompu, reconnexion :", e)
+                        time.sleep(3)
+            if self.current == j["id"]:
+                size = os.path.getsize(f) if os.path.exists(f) else 0
+                self.set(j, status="terminé" if size > (1 << 20) else "échec", bytes=size,
+                         error=None if size > (1 << 20) else "rien n'a été reçu")
+                log("enregistrement du direct terminé", j["title"], size)
+        finally:
+            if self.current == j["id"]:
+                self.current = None
+
     def summary(self):
         with self.lock:
-            return {k: sum(1 for j in self.jobs if j["status"] == k) for k in ("en attente", "en cours", "en pause", "terminé", "échec")}
+            return {k: sum(1 for j in self.jobs if j["status"] == k) for k in ("programmé", "en attente", "en cours", "en pause", "terminé", "échec")}
 
 
 RECORDER = Recorder()
@@ -1388,6 +1492,7 @@ def status():
         "sessions": SESSIONS.describe(), "stats": STATS.snapshot(),
         "storage": {"ok": STORAGE.ok, "free": STORAGE.free(), "total": STORAGE.total(), "error": STORAGE.error,
                     "recordings": RECORDER.summary() if STORAGE.ok else {}},
+        "recording": RECORDER.recording_now() if STORAGE.ok else None,
     }
 
 
@@ -1437,6 +1542,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self.js(RECORDER.add(q))
                 except Exception as e:
                     return self.js({"error": str(e)}, 409)
+            if u.path == "/rec/schedule":
+                try:
+                    return self.js(RECORDER.schedule(q))
+                except Exception as e:
+                    return self.js({"error": str(e)}, 409)
+            if u.path == "/rec/stop":
+                RECORDER.stop(q.get("id", ""))
+                return self.js({"ok": True})
+            if u.path == "/busy":
+                Sessions.remote_busy_until = time.time() + 90
+                return self.js({"ok": True})
             if u.path == "/rec/list":
                 return self.js({"storage": status()["storage"], "items": RECORDER.listing()})
             if u.path == "/rec/delete":
@@ -1518,7 +1634,16 @@ class Handler(BaseHTTPRequestHandler):
                 last = e
         raise last
 
+    def recording_conflict(self):
+        r = RECORDER.live_active()
+        if r:
+            self.js({"error": "Enregistrement en cours de « %s » : arrête-le pour regarder autre chose." % r["title"]}, 423)
+            return True
+        return False
+
     def live_open(self, url):
+        if self.recording_conflict():
+            return
         self.note_upstream(url)
         STATS.reset("direct ts découpé par le Raspberry (ffmpeg)")
         sid, s = SESSIONS.open("live", lambda sid: LiveSession(sid, url))
@@ -1531,6 +1656,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.js({"id": sid, "url": "/s/%s/live.m3u8" % sid})
 
     def vod_open(self, url, ext, start=0.0):
+        if urllib.parse.urlparse(url).hostname not in ("127.0.0.1", "localhost") and self.recording_conflict():
+            return
         self.note_upstream(url)
         if ext in ("mp4", "m4v", "mov"):
             STATS.reset("mp4 relayé tel quel par le Raspberry")
