@@ -19,7 +19,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1261,11 +1261,13 @@ class TranscodeSession:
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-user_agent", UA,
                "-reconnect", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "4"]
         if self.offset > 0:
-            cmd += ["-ss", "%.3f" % self.offset]
+            # Image copiée : elle repart de l'image clé précédente ; le son doit repartir du même point,
+            # sinon il est décalé de plusieurs secondes
+            cmd += ["-ss", "%.3f" % self.offset, "-noaccurate_seek"]
         cmd += ["-i", url, "-map", "0:v:0", "-map", "0:a:%d" % pick, "-c:v", "copy"]
         if hevc:
             cmd += ["-tag:v", "hvc1"]
-        cmd += ["-c:a", "ac3", "-b:a", "448k", "-sn", "-dn",
+        cmd += ["-c:a", "ac3", "-b:a", "448k", "-sn", "-dn", "-avoid_negative_ts", "make_zero",
                 "-f", "hls", "-hls_time", "4", "-hls_playlist_type", "event", "-hls_segment_type", "fmp4",
                 "-hls_flags", "independent_segments+temp_file", "-hls_fmp4_init_filename", "init.mp4",
                 "-hls_segment_filename", os.path.join(self.dir, "seg_%05d.m4s"), os.path.join(self.dir, "vod.m3u8")]
