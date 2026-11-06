@@ -11,6 +11,7 @@ Le Raspberry joint le serveur IPTV à travers NordVPN et sert à l'iPhone et à 
   /probe?u=URL             le serveur accepte-t-il les plages d'octets (replay lisible comme un film) ?
   /rec/add, /rec/schedule, /rec/list, /rec/stop?id=, /rec/delete?id=, /rec/file/<id>.ts   enregistrements (clé USB)
   /busy                    l'iPhone lit en direct depuis la 5G : les enregistrements de replay se mettent en pause
+  /wg/client               configuration WireGuard de l'iPhone (donnée seulement sur le réseau de la maison)
 Une seule lecture à la fois vers le serveur (abonnement limité à une connexion).
 Bibliothèque standard Python uniquement, plus ffmpeg.
 """
@@ -18,7 +19,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1481,6 +1482,108 @@ class Recorder:
 RECORDER = Recorder()
 
 
+# ---------------------------------------------------------------- WireGuard : l'app joint le Raspberry de partout
+
+WG_DIR = "/etc/tvlibre/wg"
+WG_PORT = 51820
+WG_NET = "10.66.0.0/24"
+
+
+class WireGuard:
+    """Serveur WireGuard minimal (10.66.0.1) : l'app de l'iPhone s'y connecte hors de la maison.
+    Le port est ouvert sur la box par UPnP si elle le permet."""
+
+    def __init__(self):
+        self.ok = False
+        self.public_ip = None
+        self.upnp = False
+        self.error = None
+        self.note = None
+
+    def read(self, name):
+        with open(os.path.join(WG_DIR, name)) as f:
+            return f.read().strip()
+
+    def keys(self):
+        os.makedirs(WG_DIR, mode=0o700, exist_ok=True)
+        for who in ("server", "client"):
+            k = os.path.join(WG_DIR, who + ".key")
+            if not os.path.exists(k):
+                priv = subprocess.run(["wg", "genkey"], capture_output=True, text=True, check=True).stdout.strip()
+                pub = subprocess.run(["wg", "pubkey"], input=priv, capture_output=True, text=True, check=True).stdout.strip()
+                with open(k, "w") as f:
+                    f.write(priv)
+                os.chmod(k, 0o600)
+                with open(os.path.join(WG_DIR, who + ".pub"), "w") as f:
+                    f.write(pub)
+
+    def setup(self):
+        if not shutil.which("wg") or not shutil.which("upnpc"):
+            log("installation de WireGuard")
+            subprocess.run(["apt-get", "install", "-y", "wireguard-tools", "miniupnpc"],
+                           capture_output=True, text=True, timeout=900, env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
+        if not shutil.which("wg"):
+            raise IOError("WireGuard non installé")
+        self.keys()
+        conf = "[Interface]\nAddress = 10.66.0.1/24\nListenPort = %d\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.66.0.2/32\n" % (
+            WG_PORT, self.read("server.key"), self.read("client.pub"))
+        path = "/etc/wireguard/tvlibre.conf"
+        old = open(path).read() if os.path.exists(path) else ""
+        if old != conf:
+            os.makedirs("/etc/wireguard", exist_ok=True)
+            with open(path, "w") as f:
+                f.write(conf)
+            os.chmod(path, 0o600)
+            sh(["systemctl", "enable", "wg-quick@tvlibre"], timeout=30)
+            sh(["systemctl", "restart", "wg-quick@tvlibre"], timeout=60)
+        elif "tvlibre" not in sh(["wg", "show", "interfaces"]):
+            sh(["systemctl", "restart", "wg-quick@tvlibre"], timeout=60)
+        if shutil.which("nordvpn") and not os.path.exists(os.path.join(WG_DIR, "allowlist-ok")):
+            sh(["nordvpn", "whitelist", "add", "port", str(WG_PORT), "protocol", "UDP"], timeout=30)
+            sh(["nordvpn", "whitelist", "add", "subnet", WG_NET], timeout=30)
+            open(os.path.join(WG_DIR, "allowlist-ok"), "w").close()
+        self.ok = "tvlibre" in sh(["wg", "show", "interfaces"])
+
+    def map_port(self):
+        """Ouverture du port sur la box (UPnP) et adresse publique de la maison"""
+        ip = lan_ip()
+        if not ip or not shutil.which("upnpc"):
+            return
+        out = sh(["upnpc", "-e", "TV Libre", "-a", ip, str(WG_PORT), str(WG_PORT), "UDP", "86400"], timeout=30)
+        self.upnp = "is redirected to internal" in out
+        m = re.search(r"ExternalIPAddress = ([0-9.]+)", out) or re.search(r"ExternalIPAddress = ([0-9.]+)", sh(["upnpc", "-s"], timeout=30))
+        if m:
+            self.public_ip = m.group(1)
+            a = [int(x) for x in self.public_ip.split(".")]
+            if a[0] == 10 or (a[0] == 100 and 64 <= a[1] < 128) or (a[0] == 192 and a[1] == 168) or (a[0] == 172 and 16 <= a[1] < 32):
+                self.note = "la box n'a pas d'adresse publique (CGNAT) : demande une IPv4 publique à Sunrise"
+            else:
+                self.note = None if self.upnp else "ouvre le port %d UDP de la box vers %s" % (WG_PORT, ip)
+        else:
+            self.note = "UPnP indisponible sur la box : ouvre le port %d UDP vers %s et indique l'adresse publique dans l'app" % (WG_PORT, ip)
+
+    def client_config(self):
+        return "[Interface]\nPrivateKey = %s\nAddress = 10.66.0.2/32\n\n[Peer]\nPublicKey = %s\nEndpoint = %s:%d\nAllowedIPs = 10.66.0.1/32\nPersistentKeepalive = 25\n" % (
+            self.read("client.key"), self.read("server.pub"), self.public_ip or "ADRESSE_PUBLIQUE", WG_PORT)
+
+    def loop(self):
+        while True:
+            try:
+                self.setup()
+                self.map_port()
+                self.error = None
+            except Exception as e:
+                self.error = str(e)[:200]
+                log("wireguard :", e)
+            time.sleep(1800)
+
+    def describe(self):
+        return {"ok": self.ok, "public_ip": self.public_ip, "upnp": self.upnp, "port": WG_PORT, "note": self.note, "error": self.error}
+
+
+WG = WireGuard()
+
+
 def status():
     return {
         "version": VERSION, "lan_ip": lan_ip(), "port": PORT,
@@ -1493,6 +1596,7 @@ def status():
         "storage": {"ok": STORAGE.ok, "free": STORAGE.free(), "total": STORAGE.total(), "error": STORAGE.error,
                     "recordings": RECORDER.summary() if STORAGE.ok else {}},
         "recording": RECORDER.recording_now() if STORAGE.ok else None,
+        "wireguard": WG.describe(),
     }
 
 
@@ -1550,6 +1654,14 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/rec/stop":
                 RECORDER.stop(q.get("id", ""))
                 return self.js({"ok": True})
+            if u.path == "/wg/client":
+                # Donnée seulement aux appareils du réseau de la maison
+                ip = self.client_address[0]
+                if not (ip.startswith("192.168.") or ip.startswith("172.") or (ip.startswith("10.") and not ip.startswith("10.66."))):
+                    return self.js({"error": "seulement depuis le réseau de la maison"}, 403)
+                if not WG.ok:
+                    return self.js({"error": WG.error or "WireGuard pas encore prêt"}, 503)
+                return self.js({"config": WG.client_config(), **WG.describe()})
             if u.path == "/busy":
                 Sessions.remote_busy_until = time.time() + 90
                 return self.js({"ok": True})
@@ -1739,6 +1851,7 @@ def main():
     threading.Thread(target=mtu_keeper, daemon=True).start()
     threading.Thread(target=STORAGE.loop, daemon=True).start()
     threading.Thread(target=RECORDER.loop, daemon=True).start()
+    threading.Thread(target=WG.loop, daemon=True).start()
     srv = Server(("0.0.0.0", PORT), Handler)
     log("TV Libre relais %s sur le port %d" % (VERSION, PORT))
     srv.serve_forever()
