@@ -18,11 +18,11 @@ Le Raspberry joint le serveur IPTV à travers NordVPN et sert à l'iPhone et à 
 Une seule lecture à la fois vers le serveur (abonnement limité à une connexion).
 Bibliothèque standard Python uniquement, plus ffmpeg.
 """
-import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, time, uuid
+import collections, json, math, os, re, shutil, socket, struct, subprocess, sys, threading, time, uuid
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1212,6 +1212,22 @@ class Loudness:
 LOUDNESS = Loudness()
 
 
+ZAPLOG = collections.deque(maxlen=1500)
+
+
+def zlog(*a):
+    """Journal du zapping : commandes reçues, morceaux ajoutés, ce que l'Apple TV demande (/tv/trace)"""
+    t = time.time()
+    ZAPLOG.append("%s.%03d %s" % (time.strftime("%H:%M:%S", time.localtime(t)), int(t * 1000) % 1000, " ".join(str(x) for x in a)))
+
+
+def chan(url, logo=None):
+    """Nom court d'une chaîne pour le journal (numéro du flux, nom du logo), sans identifiants"""
+    k = Loudness.key(url) if url else "?"
+    lg = urllib.parse.urlparse(logo).path.rsplit("/", 1)[-1][:30] if logo else ""
+    return "%s%s" % (k, ("(" + lg + ")") if lg else "")
+
+
 class TVSession:
     """Direct à adresse fixe : l'Apple TV lit toujours tv.m3u8 ; au changement de chaîne, le Raspberry
     coupe la connexion, glisse le logo de la nouvelle chaîne, puis enchaîne ses morceaux (marque de rupture)."""
@@ -1238,6 +1254,7 @@ class TVSession:
         threading.Thread(target=self._watch, daemon=True).start()
 
     def _append(self, name, dur, path, disc):
+        zlog("  + morceau", name, "%.2fs" % dur, "RUPTURE" if disc else "")
         with self.lock:
             self.files[name] = path
             self.entries.append((name, dur, disc))
@@ -1251,6 +1268,7 @@ class TVSession:
 
     def switch(self, url, logo=None, filler=True):
         """Change de chaîne sans changer d'adresse"""
+        zlog("ZAP demandé par l'app →" if filler else "relance de la chaîne (ffmpeg arrêté) →", chan(url, logo if filler else self.logo))
         with self.lock:
             self.gen += 1
             gen = self.gen
@@ -1375,14 +1393,23 @@ class TVSession:
                 out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:%d" % target,
                        "#EXT-X-MEDIA-SEQUENCE:%d" % self.media_seq, "#EXT-X-DISCONTINUITY-SEQUENCE:%d" % self.disc_seq]
                 for i, (n, du, disc) in enumerate(self.entries):
-                    if disc and i > 0:
+                    # Marque de rupture écrite aussi devant le premier morceau : elle ne sort de la liste qu'avec
+                    # lui, en même temps que le compteur avance (sinon l'Apple TV recalait les ruptures d'un cran
+                    # et mélangeait les horloges des chaînes : image et son décalés après quelques zappings)
+                    if disc:
                         out.append("#EXT-X-DISCONTINUITY")
                     out += ["#EXTINF:%.3f," % du, n]
+                sig = (self.media_seq, len(self.entries))
+            if sig != getattr(self, "_last_sig", None):
+                self._last_sig = sig
+                zlog("  liste lue par l'Apple TV : seq", sig[0], "ruptures", self.disc_seq, "→", self.entries[-1][0] if self.entries else "vide")
             return ("\n".join(out) + "\n").encode(), "application/vnd.apple.mpegurl"
         with self.lock:
             p = self.files.get(name)
         if not p or not os.path.exists(p):
+            zlog("  Apple TV demande", name, "INTROUVABLE")
             raise KeyError(name)
+        zlog("  Apple TV lit", name)
         with open(p, "rb") as fh:
             return fh.read(), "video/mp2t"
 
@@ -2295,7 +2322,11 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/vod/open":
                 return self.vod_open(q["u"], q.get("ext", "mkv").lower(), float(q.get("start", "0") or 0),
                                      float(q.get("gain", "-5") or -5))
+            if u.path == "/tv/trace":
+                n = int(q.get("n", "400") or 400)
+                return self.send(200, ("\n".join(list(ZAPLOG)[-n:]) + "\n").encode(), "text/plain; charset=utf-8")
             if u.path == "/tv/open":
+                zlog("OUVERTURE du direct continu →", chan(q.get("u"), q.get("logo")))
                 return self.tv_open(q["u"], q.get("logo"))
             if u.path == "/tv/switch":
                 return self.tv_switch(q.get("id", ""), q["u"], q.get("logo"))
@@ -2512,7 +2543,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.js({"error": "le direct ne démarre pas"}, 504)
         return self.js({"id": sid, "url": "/s/%s/tv.m3u8" % sid})
 
+    # Zapping continu (même adresse, l'Apple TV enchaîne) : coupé. L'Apple TV garde 15 à 30 s d'avance de l'ancienne
+    # chaîne et les lit avant la nouvelle, puis le retard s'accumule d'un zapping à l'autre. En le refusant, l'app
+    # rouvre une session neuve à chaque chaîne (changement immédiat, logo de la chaîne au démarrage).
+    ZAP_CONTINUOUS = False
+
     def tv_switch(self, sid, url, logo):
+        if not self.ZAP_CONTINUOUS:
+            zlog("ZAP →", chan(url, logo), ": zapping continu coupé, l'app rouvre une session")
+            return self.js({"error": "zapping continu désactivé"}, 410)
         if self.recording_conflict():
             return
         s = SESSIONS.get(sid)
