@@ -19,7 +19,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -957,6 +957,48 @@ class TSSession:
 
 
 # ---------------------------------------------------------------- mp4 : relayé tel quel (plages d'octets)
+
+class Mp4Session:
+    """mp4 : une seule connexion continue au serveur (le compte n'en accepte qu'une). Les demandes de plage
+    du lecteur sont servies depuis la réserve ; l'index (moov) en fin de fichier est lu une fois au départ."""
+    CHUNK = 8 << 20
+
+    def __init__(self, url):
+        self.url = url
+        self.duration = None
+        self.f = RemoteFile(url)
+        head = self.f.read_range(0, 64 * 1024)
+        if not self.f.size:
+            raise IOError("taille du fichier inconnue")
+        self.tail = (0, b"")
+        # Boîtes de premier niveau : si l'index est après les données, on le garde en mémoire
+        pos, data = 0, head
+        while pos + 8 <= len(data):
+            size, kind = struct.unpack(">I4s", data[pos:pos + 8])
+            if size == 1 and pos + 16 <= len(data):
+                size = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
+            if size < 8:
+                break
+            if kind == b"mdat":
+                moov = pos + size
+                if moov < self.f.size and self.f.size - moov <= (64 << 20):
+                    self.tail = (moov, self.f.read_range(moov, self.f.size - moov))
+                break
+            if kind == b"moov":
+                break
+            pos += size
+        self.lock = threading.Lock()
+
+    def read(self, a, b):
+        t0, td = self.tail
+        if td and a >= t0:
+            return td[a - t0:b - t0 + 1]
+        with self.lock:                     # une seule lecture à la fois : pas de connexions concurrentes
+            return self.f.read_stream(a, b - a + 1)
+
+    def close(self):
+        self.f.close()
+
 
 class ProxySession:
     def __init__(self, url):
@@ -2117,7 +2159,7 @@ class Handler(BaseHTTPRequestHandler):
         self.note_upstream(url)
         if ext in ("mp4", "m4v", "mov"):
             STATS.reset("mp4 relayé tel quel par le Raspberry")
-            sid, _ = SESSIONS.open("mp4", lambda sid: ProxySession(url))
+            sid, _ = SESSIONS.open("mp4", lambda sid: Mp4Session(url))
             return self.js({"id": sid, "url": "/s/%s/file.%s" % (sid, ext)})
         if ext == "mkv":
             STATS.reset("mkv réemballé par le Raspberry")
@@ -2149,6 +2191,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(404, b"session terminee")
         if isinstance(s, ProxySession):
             return self.proxy(s.url, head)
+        if isinstance(s, Mp4Session):
+            return self.mp4(s, head)
         body, ctype = s.get(name)
         off = getattr(s, "start_offset", 0)
         if off > 0 and name.endswith(".m3u8") and body.startswith(b"#EXTM3U\n"):
@@ -2161,6 +2205,22 @@ class Handler(BaseHTTPRequestHandler):
             b = min(len(body) - 1, int(m.group(2)) if m.group(2) else len(body) - 1)
             return self.send(206, body[a:b + 1], ctype, {"Content-Range": "bytes %d-%d/%d" % (a, b, len(body)), "Accept-Ranges": "bytes"}, head)
         self.send(200, body, ctype, {"Accept-Ranges": "bytes"}, head)
+
+    def mp4(self, s, head):
+        size = s.f.size
+        m = re.fullmatch(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
+        a = int(m.group(1)) if m else 0
+        if a >= size:
+            return self.send(416, b"", "text/plain", {"Content-Range": "bytes */%d" % size}, head)
+        b = min(size - 1, int(m.group(2)) if m and m.group(2) else size - 1, a + s.CHUNK - 1)
+        if head:
+            self.send_response(200)
+            for k, v in (("Content-Type", "video/mp4"), ("Content-Length", str(size)), ("Accept-Ranges", "bytes")):
+                self.send_header(k, v)
+            self.end_headers()
+            return
+        data = s.read(a, b)
+        self.send(206, data, "video/mp4", {"Content-Range": "bytes %d-%d/%d" % (a, a + len(data) - 1, size), "Accept-Ranges": "bytes"})
 
     def proxy(self, url, head):
         """mp4 : la demande de plage du lecteur est transmise au serveur, la réponse renvoyée au fil de l'eau."""
