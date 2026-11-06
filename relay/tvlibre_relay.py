@@ -22,7 +22,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1147,6 +1147,68 @@ class Logos:
 LOGOS = Logos()
 
 
+class Loudness:
+    """Égalisation du son des chaînes : le niveau de chaque chaîne est mesuré pendant qu'on la regarde
+    (norme EBU R128) et retenu ; aux visionnages suivants, un gain la ramène à -23 LUFS. Pas d'attente
+    ajoutée au zapping (pas d'analyse à l'avance), presque rien en calcul (son seul réencodé)."""
+    TARGET = -23.0
+    FILE = os.path.join(os.path.dirname(LOGO_DIR), "loudness.json")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        try:
+            self.levels = json.load(open(self.FILE))
+        except Exception:
+            self.levels = {}
+
+    @staticmethod
+    def key(url):
+        """Identifiant de la chaîne sans les identifiants du compte (numéro du flux)"""
+        base = urllib.parse.urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+        return base.rsplit(".", 1)[0] or url
+
+    def gain(self, key):
+        with self.lock:
+            lv = self.levels.get(key)
+        return 0.0 if lv is None else max(-10.0, min(10.0, self.TARGET - lv))
+
+    def listen(self, proc, key, gain):
+        """Lit la mesure de ffmpeg ; après 45 s, retient le niveau d'origine de la chaîne toutes les 30 s"""
+        t0, last = time.time(), 0.0
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", "replace")
+                if "TARGET" not in line or " I:" not in line:
+                    continue
+                m = re.search(r" I:\s*(-?[\d.]+) LUFS", line)
+                if not m:
+                    continue
+                now = time.time()
+                if now - t0 < 45 or now - last < 30:
+                    continue
+                last = now
+                orig = float(m.group(1)) - gain
+                if orig < -60:
+                    continue                      # silence (mire, coupure) : pas une mesure
+                with self.lock:
+                    old = self.levels.get(key)
+                    self.levels[key] = round(orig if old is None else 0.7 * old + 0.3 * orig, 1)
+                    data = dict(self.levels)
+                try:
+                    os.makedirs(os.path.dirname(self.FILE), exist_ok=True)
+                    tmp = self.FILE + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump(data, f)
+                    os.replace(tmp, self.FILE)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+
+LOUDNESS = Loudness()
+
+
 class TVSession:
     """Direct à adresse fixe : l'Apple TV lit toujours tv.m3u8 ; au changement de chaîne, le Raspberry
     coupe la connexion, glisse le logo de la nouvelle chaîne, puis enchaîne ses morceaux (marque de rupture)."""
@@ -1206,15 +1268,25 @@ class TVSession:
             self._append("logo_%d.ts" % gen, 1.0, clip, True)
         src = os.path.join(self.dir, "src%d" % gen)
         os.makedirs(src, exist_ok=True)
-        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
+        # Niveau sonore égalisé d'une chaîne à l'autre : gain appris aux visionnages précédents,
+        # son principal réencodé (les autres langues restent telles quelles). Trop chaud ou échecs : copie simple.
+        key = LOUDNESS.key(url)
+        level = not is_hot() and getattr(self, "fails", 0) < 2
+        gain = LOUDNESS.gain(key) if level else 0.0
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info" if level else "warning",
                "-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
                "-reconnect_delay_max", "4", "-rw_timeout", "15000000",
                "-fflags", "+genpts+discardcorrupt", "-i", url,
-               "-map", "0:v:0?", "-map", "0:a?", "-c", "copy", "-sn", "-dn",
-               "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
-               "-hls_flags", "delete_segments+independent_segments+omit_endlist+temp_file",
-               "-hls_segment_filename", os.path.join(src, "seg_%06d.ts"), os.path.join(src, "live.m3u8")]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+               "-map", "0:v:0?", "-map", "0:a?", "-c", "copy"]
+        if level:
+            cmd += ["-c:a:0", "aac", "-b:a:0", "160k", "-ar:a:0", "48000",
+                    "-filter:a:0", "volume=%.1fdB,ebur128=framelog=info" % gain]
+        cmd += ["-sn", "-dn", "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
+                "-hls_flags", "delete_segments+independent_segments+omit_endlist+temp_file",
+                "-hls_segment_filename", os.path.join(src, "seg_%06d.ts"), os.path.join(src, "live.m3u8")]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE if level else subprocess.DEVNULL)
+        if level:
+            threading.Thread(target=LOUDNESS.listen, args=(proc, key, gain), daemon=True).start()
         with self.lock:
             self.proc, self.src, self.url, self.first = proc, (gen, src), url, True
         # Anciennes sources : effacées quand plus aucun de leurs morceaux n'est dans la liste
