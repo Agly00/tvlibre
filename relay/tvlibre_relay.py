@@ -22,7 +22,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.5.1"
+VERSION = "1.5.2"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1152,6 +1152,9 @@ class Loudness:
     (norme EBU R128) et retenu ; aux visionnages suivants, un gain la ramène à -23 LUFS. Pas d'attente
     ajoutée au zapping (pas d'analyse à l'avance), presque rien en calcul (son seul réencodé)."""
     TARGET = -23.0
+    # Suspendu : le son réencodé à part de l'image copiée peut se décaler sur les chaînes dont l'horloge saute
+    # (zapping signalé « décalé et déréglé »). À reprendre avec un test sur les vraies chaînes.
+    ENABLED = False
     FILE = os.path.join(os.path.dirname(LOGO_DIR), "loudness.json")
 
     def __init__(self):
@@ -1271,7 +1274,7 @@ class TVSession:
         # Niveau sonore égalisé d'une chaîne à l'autre : gain appris aux visionnages précédents,
         # son principal réencodé (les autres langues restent telles quelles). Trop chaud ou échecs : copie simple.
         key = LOUDNESS.key(url)
-        level = not is_hot() and getattr(self, "fails", 0) < 2
+        level = Loudness.ENABLED and not is_hot() and getattr(self, "fails", 0) < 2
         gain = LOUDNESS.gain(key) if level else 0.0
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info" if level else "warning",
                "-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
@@ -1321,6 +1324,7 @@ class TVSession:
                     if name not in self.seen and gen == self.gen:
                         self.seen.add(name)
                         self._append(name, dur, os.path.join(d, ln), first)
+                        self.seg_len = max(dur or 2.0, 0.7 * getattr(self, "seg_len", 2.0))
                         first = False
                         with self.lock:
                             self.first = False
@@ -1330,9 +1334,11 @@ class TVSession:
             # Sans ça la liste cesse d'avancer et l'Apple TV finit par abandonner la lecture.
             with self.lock:
                 filling = bool(self.entries) and self.entries[-1][0].startswith(("logo_", "fill_"))
-            # 4,5 s de silence pour déclencher (une chaîne normale envoie un morceau toutes les 2 s),
-            # puis un logo par seconde : l'Apple TV garde un flux en temps réel, sans attente
-            if time.time() - self.last_add > (0.95 if filling else 4.5) and not self.stopped:
+            # Déclenché seulement après un vrai silence : 3 fois la durée des morceaux de la chaîne (au moins 8 s ;
+            # certaines chaînes envoient des morceaux de 5 à 6 s, un seuil fixe intercalait des logos en pleine
+            # lecture et décalait tout), puis un logo par seconde tant que la chaîne se tait
+            limit = 0.95 if filling else max(8.0, 3 * getattr(self, "seg_len", 2.0))
+            if time.time() - self.last_add > limit and not self.stopped:
                 clip = LOGOS.get(self.logo)
                 if clip:
                     self.fillers += 1
