@@ -19,7 +19,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1182,10 +1182,18 @@ class Storage:
                 log("clé USB retirée")
             if os.path.ismount(MOUNT):
                 sh(["umount", "-l", MOUNT], timeout=30)
-            self.ok, self.device = False, None
+            self.ok, self.device, self.error = False, None, None
+            self.formatted.clear()          # nouvelle clé : on pourra la formater
             return
         dev = "/dev/" + p["name"]
+        disk = re.sub(r"\d+$", "", p["name"])
         try:
+            try:
+                ro = open("/sys/block/%s/ro" % disk).read().strip() == "1"
+            except OSError:
+                ro = False
+            if ro:
+                raise IOError("clé protégée en écriture (verrou sur la clé, ou clé usée) : branche une autre clé")
             if p.get("fstype") != "ext4" or p.get("label") != LABEL:
                 if dev in self.formatted:
                     raise IOError("formatage déjà tenté sans succès")
