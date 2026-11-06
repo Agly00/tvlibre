@@ -19,7 +19,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -420,7 +420,7 @@ def open_mkv(f):
     pts.sort()
     segs = []
     for t, cp in pts:
-        if segs and (cp == segs[-1][1] or t - segs[-1][0] < 10):
+        if segs and (cp == segs[-1][1] or t - segs[-1][0] < 4):     # ~4 s : sauts plus rapides
             continue
         segs.append((t, cp))
     if not segs:
@@ -675,6 +675,7 @@ class MKVSession:
             if s: self.audios.append((t, s))
             else: refused.append(t.codec)
         if not self.audios:
+            self.f.close()          # libère la connexion du compte avant la conversion du son
             raise IOError("son non pris en charge : " + ", ".join(refused))
         self.audios.sort(key=lambda a: (not is_fr(a[0].lang), not a[0].default))
         self.subs = [t for t in tr if t.type == 17 and not t.compressed and t.codec in self.TEXT_SUBS]
@@ -726,7 +727,7 @@ class MKVSession:
             with self.lock:
                 self.cache[i] = r
                 self.order.append(i)
-                while len(self.order) > 8:
+                while len(self.order) > 20:
                     self.cache.pop(self.order.pop(0), None)
             return r
         finally:
@@ -735,7 +736,7 @@ class MKVSession:
             ev.set()
 
     def prefetch(self, i):
-        for k in range(1, 5):
+        for k in range(1, 11):
             j = i + k
             if j < len(self.ix["segs"]):
                 with self.lock:
@@ -926,7 +927,7 @@ class TSSession:
         self.duration = ((lastp - first) % (1 << 33)) / 90000
         if self.duration < 1: raise IOError("durée inconnue")
         self.start = s0
-        self.seg = max(188 * 2000, int(size * 10 / self.duration) // 188 * 188)
+        self.seg = max(188 * 1000, int(size * 4 / self.duration) // 188 * 188)     # ~4 s par morceau
         self.count = math.ceil((size - s0) / self.seg)
         self.header = pat + pmt
         STATS.bitrate = size * 8 / self.duration / 1e6
@@ -1019,6 +1020,276 @@ class LiveSession:
     def close(self):
         self.stopped = True
         if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(3)
+            except Exception:
+                self.proc.kill()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- zapping continu : une seule adresse pour l'Apple TV
+
+HOT = 75.0          # au-dessus : tâches facultatives suspendues (logos, enregistrements de replay)
+LOGO_DIR = os.environ.get("TVLIBRE_LOGOS", "/var/cache/tvlibre/logos")
+
+
+def is_hot():
+    t = temperature()
+    return t is not None and t >= HOT
+
+
+class Logos:
+    """Courts morceaux « logo de la chaîne sur fond noir », fabriqués une fois puis gardés"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.busy = set()
+
+    def path(self, logo):
+        import hashlib
+        key = hashlib.sha1((logo or "noir").encode()).hexdigest()[:16]
+        return os.path.join(LOGO_DIR, key + ".ts")
+
+    def get(self, logo):
+        """Chemin du morceau s'il existe ; sinon lancé en fond, et le morceau noir sert en attendant"""
+        p = self.path(logo)
+        if os.path.exists(p):
+            return p
+        if logo and not is_hot():
+            with self.lock:
+                if p not in self.busy:
+                    self.busy.add(p)
+                    threading.Thread(target=self.make, args=(logo, p), daemon=True).start()
+        black = self.path(None)
+        if not os.path.exists(black):
+            self.make(None, black)
+        return black if os.path.exists(black) else None
+
+    def make(self, logo, p):
+        os.makedirs(LOGO_DIR, exist_ok=True)
+        tmp = p + ".tmp.ts"
+        try:
+            src = ["-f", "lavfi", "-i", "color=c=black:s=1280x720:r=25:d=1"]
+            vf = "format=yuv420p"
+            if logo:
+                img = p + ".img"
+                with http_get(logo, timeout=10) as r, open(img, "wb") as f:
+                    f.write(r.read(2 << 20))
+                src = ["-f", "lavfi", "-i", "color=c=black:s=1280x720:r=25:d=1", "-i", img]
+                vf = "[1:v]scale=420:420:force_original_aspect_ratio=decrease[l];[0:v][l]overlay=(W-w)/2:(H-h)/2,format=yuv420p"
+            cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"] + src + [
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1",
+                "-filter_complex" if logo else "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-g", "25",
+                "-c:a", "aac", "-b:a", "64k", "-shortest", "-f", "mpegts", tmp]
+            subprocess.run(cmd, capture_output=True, timeout=60)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 1000:
+                os.replace(tmp, p)
+        except Exception as e:
+            log("logo :", e)
+        finally:
+            for f in (tmp, p + ".img"):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            with self.lock:
+                self.busy.discard(p)
+
+
+LOGOS = Logos()
+
+
+class TVSession:
+    """Direct à adresse fixe : l'Apple TV lit toujours tv.m3u8 ; au changement de chaîne, le Raspberry
+    coupe la connexion, glisse le logo de la nouvelle chaîne, puis enchaîne ses morceaux (marque de rupture)."""
+    WINDOW = 10
+
+    def __init__(self, sid, url, logo=None):
+        self.sid = sid
+        self.dir = os.path.join(RUN, sid)
+        os.makedirs(self.dir, exist_ok=True)
+        self.lock = threading.Lock()
+        self.entries = []            # (nom, durée, rupture avant)
+        self.media_seq = 0
+        self.disc_seq = 0
+        self.gen = 0
+        self.proc = None
+        self.src = None
+        self.seen = set()
+        self.stopped = False
+        self.files = {}              # nom servi → chemin
+        self.switch(url, logo)
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _append(self, name, dur, path, disc):
+        with self.lock:
+            self.files[name] = path
+            self.entries.append((name, dur, disc))
+            while len(self.entries) > self.WINDOW:
+                old = self.entries.pop(0)
+                self.media_seq += 1
+                if old[2]:
+                    self.disc_seq += 1
+                self.files.pop(old[0], None)
+
+    def switch(self, url, logo=None, filler=True):
+        """Change de chaîne sans changer d'adresse"""
+        with self.lock:
+            self.gen += 1
+            gen = self.gen
+            old = self.proc
+            self.proc = None
+        if old and old.poll() is None:
+            old.terminate()
+            try:
+                old.wait(3)
+            except Exception:
+                old.kill()
+        clip = LOGOS.get(logo) if filler else None
+        if clip:
+            self._append("logo_%d.ts" % gen, 1.0, clip, True)
+        src = os.path.join(self.dir, "src%d" % gen)
+        os.makedirs(src, exist_ok=True)
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
+               "-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
+               "-reconnect_delay_max", "4", "-rw_timeout", "15000000",
+               "-fflags", "+genpts+discardcorrupt", "-i", url,
+               "-map", "0:v:0?", "-map", "0:a?", "-c", "copy", "-sn", "-dn",
+               "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
+               "-hls_flags", "delete_segments+independent_segments+omit_endlist+temp_file",
+               "-hls_segment_filename", os.path.join(src, "seg_%06d.ts"), os.path.join(src, "live.m3u8")]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with self.lock:
+            self.proc, self.src, self.url, self.first = proc, (gen, src), url, True
+        # Anciennes sources : effacées quand plus aucun de leurs morceaux n'est dans la liste
+        threading.Thread(target=self._cleanup, args=(gen,), daemon=True).start()
+
+    def _cleanup(self, gen):
+        time.sleep(40)
+        for d in os.listdir(self.dir):
+            if d.startswith("src") and d[3:].isdigit() and int(d[3:]) < gen - 1:
+                shutil.rmtree(os.path.join(self.dir, d), ignore_errors=True)
+
+    def _watch(self):
+        """Ajoute à la liste les nouveaux morceaux de la chaîne en cours ; relance ffmpeg s'il s'arrête"""
+        while not self.stopped:
+            time.sleep(0.3)
+            with self.lock:
+                src, proc, first = self.src, self.proc, self.first
+            if not src:
+                continue
+            gen, d = src
+            pl = os.path.join(d, "live.m3u8")
+            try:
+                lines = open(pl).read().splitlines()
+            except OSError:
+                lines = []
+            dur = None
+            for ln in lines:
+                if ln.startswith("#EXTINF:"):
+                    dur = float(ln[8:].split(",")[0])
+                elif ln and not ln.startswith("#") and dur is not None:
+                    name = "c%d_%s" % (gen, ln)
+                    if name not in self.seen and gen == self.gen:
+                        self.seen.add(name)
+                        self._append(name, dur, os.path.join(d, ln), first)
+                        first = False
+                        with self.lock:
+                            self.first = False
+                    dur = None
+            if proc and proc.poll() is not None and gen == self.gen and not self.stopped:
+                STATS.retries += 1
+                log("direct continu : relance de la chaîne")
+                time.sleep(1)
+                self.switch(self.url, filler=False)
+
+    def ready(self):
+        with self.lock:
+            return any(not e[0].startswith("logo_") for e in self.entries)
+
+    def get(self, name):
+        if name == "tv.m3u8":
+            with self.lock:
+                target = max([2] + [math.ceil(e[1]) for e in self.entries])
+                out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:%d" % target,
+                       "#EXT-X-MEDIA-SEQUENCE:%d" % self.media_seq, "#EXT-X-DISCONTINUITY-SEQUENCE:%d" % self.disc_seq]
+                for i, (n, du, disc) in enumerate(self.entries):
+                    if disc and i > 0:
+                        out.append("#EXT-X-DISCONTINUITY")
+                    out += ["#EXTINF:%.3f," % du, n]
+            return ("\n".join(out) + "\n").encode(), "application/vnd.apple.mpegurl"
+        with self.lock:
+            p = self.files.get(name)
+        if not p or not os.path.exists(p):
+            raise KeyError(name)
+        with open(p, "rb") as fh:
+            return fh.read(), "video/mp2t"
+
+    def close(self):
+        self.stopped = True
+        with self.lock:
+            proc = self.proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(3)
+            except Exception:
+                proc.kill()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class TranscodeSession:
+    """Film dont le son n'est pas lisible par Apple (DTS, TrueHD…) : l'image est copiée telle quelle,
+    seul le son est converti en Dolby Digital (AC3) par ffmpeg. Démarre à la position de reprise."""
+
+    def __init__(self, sid, url, start=0.0):
+        self.sid, self.url = sid, url
+        self.dir = os.path.join(RUN, sid)
+        os.makedirs(self.dir, exist_ok=True)
+        f = RemoteFile(url)
+        try:
+            ix = open_mkv(f)
+        finally:
+            f.close()
+        self.duration = ix["duration"]
+        audios = [t for t in ix["tracks"] if t.type == 2]
+        pick = next((i for i, t in enumerate(audios) if is_fr(t.lang)), 0)
+        video = next((t for t in ix["tracks"] if t.type == 1), None)
+        hevc = video is not None and "HEVC" in video.codec
+        self.offset = max(0.0, min(start, max(0.0, self.duration - 30))) if start > 0 else 0.0
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-user_agent", UA,
+               "-reconnect", "1", "-reconnect_on_network_error", "1", "-reconnect_delay_max", "4"]
+        if self.offset > 0:
+            cmd += ["-ss", "%.3f" % self.offset]
+        cmd += ["-i", url, "-map", "0:v:0", "-map", "0:a:%d" % pick, "-c:v", "copy"]
+        if hevc:
+            cmd += ["-tag:v", "hvc1"]
+        cmd += ["-c:a", "ac3", "-b:a", "448k", "-sn", "-dn",
+                "-f", "hls", "-hls_time", "4", "-hls_playlist_type", "event", "-hls_segment_type", "fmp4",
+                "-hls_flags", "independent_segments+temp_file", "-hls_fmp4_init_filename", "init.mp4",
+                "-hls_segment_filename", os.path.join(self.dir, "seg_%05d.m4s"), os.path.join(self.dir, "vod.m3u8")]
+        log("film : son converti en AC3", "(reprise à %d s)" % self.offset if self.offset else "")
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def ready(self):
+        p = os.path.join(self.dir, "vod.m3u8")
+        return os.path.exists(p) and "#EXTINF" in open(p).read()
+
+    def get(self, name):
+        if not re.fullmatch(r"vod\.m3u8|init\.mp4|seg_\d+\.m4s", name):
+            raise KeyError(name)
+        p = os.path.join(self.dir, name)
+        if not os.path.exists(p):
+            raise KeyError(name)
+        with open(p, "rb") as fh:
+            data = fh.read()
+        if name.endswith(".m3u8"):
+            return data, "application/vnd.apple.mpegurl"
+        return data, "video/mp4"
+
+    def close(self):
+        if self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(3)
@@ -1426,6 +1697,8 @@ class Recorder:
                 if SESSIONS.busy_upstream():
                     self.idle_since = time.time()
                     continue
+                if is_hot():                              # trop chaud : les replays attendent
+                    continue
                 if time.time() - self.idle_since < 20:      # lecture tout juste arrêtée : on laisse la main
                     continue
                 j = self.next_job()
@@ -1627,7 +1900,7 @@ WG = WireGuard()
 def status():
     return {
         "version": VERSION, "lan_ip": lan_ip(), "port": PORT,
-        "temperature_c": temperature(), "throttled": throttled(),
+        "temperature_c": temperature(), "throttled": throttled(), "hot": is_hot(),
         "vpn": {k: v for k, v in GUARD.vpn.items() if k != "raw"},
         "upstream": {"host": GUARD.upstream_host, "reachable": GUARD.upstream_ok},
         "load": os.getloadavg()[0] if hasattr(os, "getloadavg") else None,
@@ -1680,6 +1953,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.live_open(q["u"])
             if u.path == "/vod/open":
                 return self.vod_open(q["u"], q.get("ext", "mkv").lower(), float(q.get("start", "0") or 0))
+            if u.path == "/tv/open":
+                return self.tv_open(q["u"], q.get("logo"))
+            if u.path == "/tv/switch":
+                return self.tv_switch(q.get("id", ""), q["u"], q.get("logo"))
             if u.path == "/probe":
                 return self.probe(q["u"])
             if u.path == "/rec/add":
@@ -1808,6 +2085,30 @@ class Handler(BaseHTTPRequestHandler):
             return self.js({"error": "le direct ne démarre pas"}, 504)
         return self.js({"id": sid, "url": "/s/%s/live.m3u8" % sid})
 
+    def tv_open(self, url, logo):
+        if self.recording_conflict():
+            return
+        self.note_upstream(url)
+        STATS.reset("direct continu par le Raspberry (zapping sans coupure)")
+        sid, s = SESSIONS.open("live", lambda sid: TVSession(sid, url, logo))
+        t = time.time()
+        while time.time() - t < 20 and not s.ready():
+            time.sleep(0.3)
+        if not s.ready():
+            SESSIONS.close(sid)
+            return self.js({"error": "le direct ne démarre pas"}, 504)
+        return self.js({"id": sid, "url": "/s/%s/tv.m3u8" % sid})
+
+    def tv_switch(self, sid, url, logo):
+        if self.recording_conflict():
+            return
+        s = SESSIONS.get(sid)
+        if not isinstance(s, TVSession):
+            return self.js({"error": "session terminée"}, 410)
+        self.note_upstream(url)
+        s.switch(url, logo)
+        return self.js({"ok": True})
+
     def vod_open(self, url, ext, start=0.0):
         if urllib.parse.urlparse(url).hostname not in ("127.0.0.1", "localhost") and self.recording_conflict():
             return
@@ -1818,7 +2119,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.js({"id": sid, "url": "/s/%s/file.%s" % (sid, ext)})
         if ext == "mkv":
             STATS.reset("mkv réemballé par le Raspberry")
-            sid, s = SESSIONS.open("mkv", lambda sid: MKVSession(url))
+            try:
+                sid, s = SESSIONS.open("mkv", lambda sid: MKVSession(url))
+            except IOError as e:
+                if "son non pris en charge" not in str(e):
+                    raise
+                # Son DTS ou autre : conversion du son seul en AC3
+                STATS.reset("mkv : son converti en AC3 par le Raspberry (" + str(e).split(":")[-1].strip() + ")")
+                sid, s = SESSIONS.open("mkv", lambda sid: TranscodeSession(sid, url, start))
+                t0 = time.time()
+                while not s.ready() and time.time() - t0 < 30:
+                    time.sleep(0.3)
+                return self.js({"id": sid, "url": "/s/%s/vod.m3u8" % sid, "duration": s.duration, "offset": s.offset})
             s.start_offset = start
             return self.js({"id": sid, "url": "/s/%s/master.m3u8" % sid, "duration": s.duration})
         if ext == "ts":
