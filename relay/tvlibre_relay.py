@@ -8,6 +8,8 @@ Le Raspberry joint le serveur IPTV à travers NordVPN et sert à l'iPhone et à 
   /vod/open?u=URL&ext=mkv  film : mp4 relayé tel quel, mkv réemballé en HLS fMP4, ts découpé
   /s/<id>/<fichier>        fichiers d'une session
   /close?id=<id>           fin de session
+  /probe?u=URL             le serveur accepte-t-il les plages d'octets (replay lisible comme un film) ?
+  /rec/add, /rec/list, /rec/delete?id=, /rec/file/<id>.ts   enregistrements sur la clé USB
 Une seule lecture à la fois vers le serveur (abonnement limité à une connexion).
 Bibliothèque standard Python uniquement, plus ffmpeg.
 """
@@ -15,7 +17,7 @@ import json, math, os, re, shutil, socket, struct, subprocess, sys, threading, t
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -1068,6 +1070,11 @@ class Sessions:
                 log("session inactive fermée", k)
                 self.close(k)
 
+    def busy_upstream(self):
+        """Une lecture utilise la connexion du compte (les enregistrements relus depuis la clé ne comptent pas)"""
+        with self.lock:
+            return any(v[2] != "local" for v in self.items.values())
+
     def describe(self):
         with self.lock:
             return [{"id": k, "kind": v[2], "idle_s": int(time.time() - v[1])} for k, v in self.items.items()]
@@ -1134,6 +1141,242 @@ def mtu_keeper():
         time.sleep(3)
 
 
+# ---------------------------------------------------------------- clé USB : enregistrements
+
+MOUNT = "/mnt/tvlibre"
+LABEL = "TVLIBRE"
+
+
+class Storage:
+    """Clé USB : formatée une fois (ext4, nom TVLIBRE) puis montée ; sans clé, le relais fonctionne comme avant"""
+
+    def __init__(self):
+        self.ok = False
+        self.device = None
+        self.error = None
+        self.formatted = set()
+
+    def usb_part(self):
+        try:
+            data = json.loads(sh(["lsblk", "-J", "-o", "NAME,TRAN,TYPE,FSTYPE,LABEL,MOUNTPOINT,SIZE"], timeout=10) or "{}")
+        except Exception:
+            return None
+        for d in data.get("blockdevices", []):
+            if d.get("tran") != "usb" or d.get("type") != "disk":
+                continue
+            parts = [c for c in d.get("children", []) if c.get("type") == "part"]
+            return parts[0] if parts else d
+        return None
+
+    def check(self):
+        p = self.usb_part()
+        if p is None:
+            if self.ok:
+                log("clé USB retirée")
+            if os.path.ismount(MOUNT):
+                sh(["umount", "-l", MOUNT], timeout=30)
+            self.ok, self.device = False, None
+            return
+        dev = "/dev/" + p["name"]
+        try:
+            if p.get("fstype") != "ext4" or p.get("label") != LABEL:
+                if dev in self.formatted:
+                    raise IOError("formatage déjà tenté sans succès")
+                self.formatted.add(dev)
+                log("formatage de la clé", dev)
+                if p.get("mountpoint"):
+                    sh(["umount", p["mountpoint"]], timeout=30)
+                r = subprocess.run(["mkfs.ext4", "-F", "-q", "-L", LABEL, dev], capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    raise IOError("formatage impossible : " + r.stderr.strip()[:200])
+            os.makedirs(MOUNT, exist_ok=True)
+            if not os.path.ismount(MOUNT):
+                r = subprocess.run(["mount", "-o", "noatime", dev, MOUNT], capture_output=True, text=True, timeout=30)
+                if r.returncode != 0:
+                    raise IOError("montage impossible : " + r.stderr.strip()[:200])
+            os.makedirs(os.path.join(MOUNT, "rec"), exist_ok=True)
+            self.ok, self.device, self.error = True, dev, None
+        except Exception as e:
+            self.ok, self.error = False, str(e)
+            log("clé USB :", e)
+
+    def free(self):
+        if not self.ok:
+            return 0
+        st = os.statvfs(MOUNT)
+        return st.f_bavail * st.f_frsize
+
+    def total(self):
+        if not self.ok:
+            return 0
+        st = os.statvfs(MOUNT)
+        return st.f_blocks * st.f_frsize
+
+    def loop(self):
+        while True:
+            self.check()
+            time.sleep(30)
+
+
+STORAGE = Storage()
+
+
+class Recorder:
+    """Enregistre les replays demandés sur la clé ; se met en pause dès qu'une lecture utilise le compte"""
+    MIN_FREE = 150 << 20
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs = []
+        self.loaded = False
+        self.current = None
+        self.idle_since = time.time()
+
+    def path(self, name=""):
+        return os.path.join(MOUNT, "rec", name)
+
+    def load(self):
+        if self.loaded or not STORAGE.ok:
+            return
+        try:
+            with open(self.path("jobs.json")) as f:
+                self.jobs = json.load(f)
+            for j in self.jobs:
+                if j["status"] == "en cours":
+                    j["status"] = "en attente"
+        except Exception:
+            self.jobs = []
+        self.loaded = True
+
+    def save(self):
+        if not STORAGE.ok:
+            return
+        tmp = self.path("jobs.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(self.jobs, f, ensure_ascii=False)
+        os.replace(tmp, self.path("jobs.json"))
+
+    def add(self, q):
+        if not STORAGE.ok:
+            raise IOError("pas de clé USB utilisable")
+        with self.lock:
+            self.load()
+            j = {"id": uuid.uuid4().hex[:10], "url": q["u"], "title": q.get("title", "Enregistrement"),
+                 "channel": q.get("channel", ""), "start": float(q.get("start", "0") or 0),
+                 "duration": float(q.get("duration", "0") or 0), "status": "en attente", "bytes": 0,
+                 "created": time.time(), "error": None}
+            self.jobs.append(j)
+            self.save()
+            return j
+
+    def delete(self, jid):
+        with self.lock:
+            self.load()
+            self.jobs = [j for j in self.jobs if j["id"] != jid]
+            if self.current == jid:
+                self.current = None
+            try:
+                os.remove(self.path(jid + ".ts"))
+            except OSError:
+                pass
+            self.save()
+
+    def listing(self):
+        with self.lock:
+            self.load()
+            out = []
+            for j in self.jobs:
+                d = {k: v for k, v in j.items() if k != "url"}
+                try:
+                    d["bytes"] = os.path.getsize(self.path(j["id"] + ".ts"))
+                except OSError:
+                    pass
+                out.append(d)
+            return out
+
+    def next_job(self):
+        with self.lock:
+            self.load()
+            for j in self.jobs:
+                if j["status"] in ("en attente", "en pause"):
+                    return j
+        return None
+
+    def set(self, j, **kw):
+        with self.lock:
+            j.update(kw)
+            self.save()
+
+    def loop(self):
+        while True:
+            time.sleep(5)
+            try:
+                if not STORAGE.ok:
+                    self.loaded = False
+                    continue
+                if SESSIONS.busy_upstream():
+                    self.idle_since = time.time()
+                    continue
+                if time.time() - self.idle_since < 20:      # lecture tout juste arrêtée : on laisse la main
+                    continue
+                j = self.next_job()
+                if j:
+                    self.run(j)
+            except Exception as e:
+                log("enregistrement :", e)
+
+    def run(self, j):
+        f = self.path(j["id"] + ".ts")
+        have = os.path.getsize(f) if os.path.exists(f) else 0
+        if STORAGE.free() < self.MIN_FREE:
+            return self.set(j, status="échec", error="clé pleine")
+        self.current = j["id"]
+        self.set(j, status="en cours", error=None)
+        log("enregistrement", j["title"])
+        try:
+            r = http_get(j["url"], "bytes=%d-" % have if have else None, timeout=30)
+            if have and r.status != 206:
+                have = 0                                  # pas de reprise possible : on repart du début
+            mode = "ab" if have else "wb"
+            with open(f, mode) as out:
+                t = time.time()
+                while True:
+                    if self.current != j["id"]:
+                        return                            # supprimé pendant l'enregistrement
+                    if SESSIONS.busy_upstream():
+                        self.set(j, status="en pause")
+                        log("enregistrement en pause (lecture en cours)")
+                        return
+                    if STORAGE.free() < self.MIN_FREE:
+                        self.set(j, status="échec", error="clé pleine")
+                        return
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    now = time.time()
+                    STATS.add(len(chunk), now - t)
+                    t = now
+            size = os.path.getsize(f)
+            self.set(j, status="terminé" if size > (1 << 20) else "échec", bytes=size,
+                     error=None if size > (1 << 20) else "le serveur n'a rien envoyé")
+            log("enregistrement terminé", j["title"], size)
+        except Exception as e:
+            self.set(j, status="en attente", error=str(e)[:120])
+            log("enregistrement interrompu, nouvel essai plus tard :", e)
+            time.sleep(30)
+        finally:
+            if self.current == j["id"]:
+                self.current = None
+
+    def summary(self):
+        with self.lock:
+            return {k: sum(1 for j in self.jobs if j["status"] == k) for k in ("en attente", "en cours", "en pause", "terminé", "échec")}
+
+
+RECORDER = Recorder()
+
+
 def status():
     return {
         "version": VERSION, "lan_ip": lan_ip(), "port": PORT,
@@ -1143,6 +1386,8 @@ def status():
         "load": os.getloadavg()[0] if hasattr(os, "getloadavg") else None,
         "uptime_s": int(float(open("/proc/uptime").read().split()[0])) if os.path.exists("/proc/uptime") else None,
         "sessions": SESSIONS.describe(), "stats": STATS.snapshot(),
+        "storage": {"ok": STORAGE.ok, "free": STORAGE.free(), "total": STORAGE.total(), "error": STORAGE.error,
+                    "recordings": RECORDER.summary() if STORAGE.ok else {}},
     }
 
 
@@ -1185,6 +1430,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self.live_open(q["u"])
             if u.path == "/vod/open":
                 return self.vod_open(q["u"], q.get("ext", "mkv").lower(), float(q.get("start", "0") or 0))
+            if u.path == "/probe":
+                return self.probe(q["u"])
+            if u.path == "/rec/add":
+                try:
+                    return self.js(RECORDER.add(q))
+                except Exception as e:
+                    return self.js({"error": str(e)}, 409)
+            if u.path == "/rec/list":
+                return self.js({"storage": status()["storage"], "items": RECORDER.listing()})
+            if u.path == "/rec/delete":
+                RECORDER.delete(q.get("id", ""))
+                return self.js({"ok": True})
+            m = re.fullmatch(r"/rec/file/([0-9a-f]{10})\.ts", u.path)
+            if m:
+                return self.local_file(RECORDER.path(m.group(1) + ".ts"), head)
             if u.path == "/close":
                 SESSIONS.close(q.get("id", ""))
                 return self.js({"ok": True})
@@ -1198,9 +1458,51 @@ class Handler(BaseHTTPRequestHandler):
             log("erreur", u.path, e)
             self.js({"error": str(e)}, 502)
 
+    def probe(self, url):
+        """Replay : le serveur donne-t-il la taille et accepte-t-il les plages ? (lecture façon film)"""
+        try:
+            with http_get(url, "bytes=0-1", timeout=20) as r:
+                cr = r.headers.get("Content-Range", "")
+                total = int(cr.split("/")[-1]) if r.status == 206 and "/" in cr and cr.split("/")[-1].isdigit() else 0
+                return self.js({"range": total > 0, "size": total, "status": r.status})
+        except Exception as e:
+            return self.js({"range": False, "error": str(e)[:120]})
+
+    def local_file(self, path, head):
+        """Fichier enregistré sur la clé, avec plages d'octets"""
+        if not os.path.exists(path):
+            return self.send(404, b"introuvable")
+        size = os.path.getsize(path)
+        m = re.fullmatch(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
+        a, b = 0, size - 1
+        if m:
+            a = int(m.group(1))
+            b = min(size - 1, int(m.group(2)) if m.group(2) else size - 1)
+            if a >= size:
+                return self.send(416, b"", "text/plain", {"Content-Range": "bytes */%d" % size}, head)
+        self.send_response(206 if m else 200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Content-Length", str(b - a + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        if m:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (a, b, size))
+        self.end_headers()
+        if head:
+            return
+        with open(path, "rb") as f:
+            f.seek(a)
+            left = b - a + 1
+            while left > 0:
+                chunk = f.read(min(left, 256 * 1024))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
+
     def note_upstream(self, url):
         p = urllib.parse.urlparse(url)
-        GUARD.upstream_host = p.netloc
+        if p.hostname not in ("127.0.0.1", "localhost"):
+            GUARD.upstream_host = p.netloc
 
     def api(self, url):
         self.note_upstream(url)
@@ -1240,8 +1542,9 @@ class Handler(BaseHTTPRequestHandler):
             s.start_offset = start
             return self.js({"id": sid, "url": "/s/%s/master.m3u8" % sid, "duration": s.duration})
         if ext == "ts":
-            STATS.reset("ts découpé par le Raspberry")
-            sid, s = SESSIONS.open("ts", lambda sid: TSSession(url))
+            local = urllib.parse.urlparse(url).hostname in ("127.0.0.1", "localhost")
+            STATS.reset("enregistrement relu depuis la clé" if local else "ts découpé par le Raspberry")
+            sid, s = SESSIONS.open("local" if local else "ts", lambda sid: TSSession(url))
             s.start_offset = start
             return self.js({"id": sid, "url": "/s/%s/master.m3u8" % sid, "duration": s.duration})
         return self.js({"error": "format .%s non pris en charge" % ext}, 415)
@@ -1307,6 +1610,8 @@ def main():
     threading.Thread(target=SESSIONS.reap, daemon=True).start()
     threading.Thread(target=GUARD.loop, daemon=True).start()
     threading.Thread(target=mtu_keeper, daemon=True).start()
+    threading.Thread(target=STORAGE.loop, daemon=True).start()
+    threading.Thread(target=RECORDER.loop, daemon=True).start()
     srv = Server(("0.0.0.0", PORT), Handler)
     log("TV Libre relais %s sur le port %d" % (VERSION, PORT))
     srv.serve_forever()
