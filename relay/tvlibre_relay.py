@@ -22,11 +22,11 @@ import collections, json, math, os, re, shutil, socket, struct, subprocess, sys,
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.5.5"
+VERSION = "1.6.0"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
-IDLE_STOP = {"live": 120}   # s sans demande du lecteur : session arrêtée (libère la connexion du compte)
+IDLE_STOP = {"live": 120, "idle": 120}   # s sans demande du lecteur : session arrêtée (libère la connexion du compte)
 IDLE_STOP_VOD = 6 * 3600     # film en pause : on garde la session (la télécommande peut rester des heures en pause)
 
 
@@ -1148,65 +1148,87 @@ LOGOS = Logos()
 
 
 class Loudness:
-    """Égalisation du son des chaînes : le niveau de chaque chaîne est mesuré pendant qu'on la regarde
-    (norme EBU R128) et retenu ; aux visionnages suivants, un gain la ramène à -23 LUFS. Pas d'attente
-    ajoutée au zapping (pas d'analyse à l'avance), presque rien en calcul (son seul réencodé)."""
+    """Égalisation du son, flux par flux (une chaîne peut avoir plusieurs flux). Au premier visionnage d'un flux,
+    le son passe tel quel et le Raspberry mesure la première minute à côté (norme EBU R128, sans toucher à ce que
+    reçoit l'Apple TV), puis retient le niveau. Aux visionnages suivants, seul un flux à plus de 2 dB de -23 LUFS
+    est corrigé, dès le démarrage, son recalé sur l'horloge de l'image. Nouvelle mesure tous les 30 jours.
+    Deux interrupteurs, éteints par défaut, le temps de tester : /loudness?measure=1 et /loudness?on=1."""
     TARGET = -23.0
-    # Suspendu : le son réencodé à part de l'image copiée peut se décaler sur les chaînes dont l'horloge saute
-    # (zapping signalé « décalé et déréglé »). À reprendre avec un test sur les vraies chaînes.
-    ENABLED = False
-    FILE = os.path.join(os.path.dirname(LOGO_DIR), "loudness.json")
+    MIN_GAP = 2.0
+    STALE = 30 * 86400
+    FILE = os.path.join(os.path.dirname(LOGO_DIR), "loudness2.json")
 
     def __init__(self):
         self.lock = threading.Lock()
         try:
-            self.levels = json.load(open(self.FILE))
+            d = json.load(open(self.FILE))
         except Exception:
-            self.levels = {}
+            d = {}
+        self.on = bool(d.get("on", False))
+        self.measure = bool(d.get("measure", False))
+        self.levels = d.get("levels", {})
+
+    def save(self):
+        with self.lock:
+            data = {"on": self.on, "measure": self.measure, "levels": dict(self.levels)}
+        try:
+            os.makedirs(os.path.dirname(self.FILE), exist_ok=True)
+            tmp = self.FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.FILE)
+        except OSError:
+            pass
 
     @staticmethod
     def key(url):
-        """Identifiant de la chaîne sans les identifiants du compte (numéro du flux)"""
+        """Identifiant du flux sans les identifiants du compte (numéro du flux)"""
         base = urllib.parse.urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
         return base.rsplit(".", 1)[0] or url
 
-    def gain(self, key):
+    def plan(self, key):
+        """(gain à appliquer ou None, mesurer ?) pour ce flux"""
         with self.lock:
             lv = self.levels.get(key)
-        return 0.0 if lv is None else max(-10.0, min(10.0, self.TARGET - lv))
+        known = lv is not None and time.time() - lv.get("t", 0) < self.STALE
+        gain = None
+        if self.on and lv is not None:
+            g = max(-10.0, min(10.0, self.TARGET - lv["lufs"]))
+            if abs(g) >= self.MIN_GAP:
+                gain = g
+        return gain, (self.measure and not known and gain is None)
 
-    def listen(self, proc, key, gain):
-        """Lit la mesure de ffmpeg ; après 45 s, retient le niveau d'origine de la chaîne toutes les 30 s"""
-        t0, last = time.time(), 0.0
+    def listen(self, proc, key):
+        """Lit la mesure de ffmpeg : niveau intégré retenu à 60 s de son, puis on laisse filer"""
+        done = False
         try:
             for raw in proc.stderr:
+                if done:
+                    continue                       # (on vide le tuyau, sinon ffmpeg se bloque)
                 line = raw.decode("utf-8", "replace")
-                if "TARGET" not in line or " I:" not in line:
+                if " I:" not in line:
                     continue
-                m = re.search(r" I:\s*(-?[\d.]+) LUFS", line)
-                if not m:
+                m = re.search(r"t:\s*([\d.]+).*? I:\s*(-?[\d.]+) LUFS", line)
+                if not m or float(m.group(1)) < 60:
                     continue
-                now = time.time()
-                if now - t0 < 45 or now - last < 30:
-                    continue
-                last = now
-                orig = float(m.group(1)) - gain
-                if orig < -60:
-                    continue                      # silence (mire, coupure) : pas une mesure
+                done = True
+                lufs = float(m.group(2))
+                if lufs < -60:
+                    continue                       # silence (mire, coupure) : pas une mesure
                 with self.lock:
-                    old = self.levels.get(key)
-                    self.levels[key] = round(orig if old is None else 0.7 * old + 0.3 * orig, 1)
-                    data = dict(self.levels)
-                try:
-                    os.makedirs(os.path.dirname(self.FILE), exist_ok=True)
-                    tmp = self.FILE + ".tmp"
-                    with open(tmp, "w") as f:
-                        json.dump(data, f)
-                    os.replace(tmp, self.FILE)
-                except OSError:
-                    pass
+                    self.levels[key] = {"lufs": round(lufs, 1), "t": int(time.time())}
+                zlog("  niveau sonore du flux", key, ":", lufs, "LUFS")
+                self.save()
         except Exception:
             pass
+
+    def describe(self):
+        with self.lock:
+            lv = dict(self.levels)
+        return {"on": self.on, "measure": self.measure, "target": self.TARGET,
+                "levels": {k: {"lufs": v["lufs"], "gain": round(max(-10, min(10, self.TARGET - v["lufs"])), 1),
+                               "corrigé": self.on and abs(self.TARGET - v["lufs"]) >= self.MIN_GAP,
+                               "mesuré": time.strftime("%Y-%m-%d", time.localtime(v["t"]))} for k, v in lv.items()}}
 
 
 LOUDNESS = Loudness()
@@ -1226,6 +1248,370 @@ def chan(url, logo=None):
     k = Loudness.key(url) if url else "?"
     lg = urllib.parse.urlparse(logo).path.rsplit("/", 1)[-1][:30] if logo else ""
     return "%s%s" % (k, ("(" + lg + ")") if lg else "")
+
+
+# Écran TV Libre (1280×720, JPEG) : affiché sur la télé entre deux lectures
+IDLE_JPEG_B64 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBAUEBAYFBQUGBgYHCQ4JCQgICRINDQoOFRIWFhUSFBQXGiEcFxgfGRQUHScdHyIj"
+    "JSUlFhwpLCgkKyEkJST/2wBDAQYGBgkICREJCREkGBQYJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk"
+    "JCQkJCQkJCT/wAARCALQBQADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUF"
+    "BAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVW"
+    "V1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi"
+    "4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAEC"
+    "AxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVm"
+    "Z2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq"
+    "8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD5uooorQAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKK"
+    "ACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKK"
+    "ACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAopaKAEopaKAEo"
+    "paKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKA"
+    "EopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopa"
+    "KAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEo"
+    "paKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKA"
+    "EopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKAEopaKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigA"
+    "ooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAoooo"
+    "AKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK"
+    "KACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigA"
+    "ooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAoooo"
+    "AKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK"
+    "KACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKKKACiiigBaKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKK"
+    "ACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKK"
+    "ACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACinUUANop1FADaKdRQA2inUUANo"
+    "p1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FAD"
+    "aKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQ"
+    "A2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inU"
+    "UANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop"
+    "1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FADaKdRQA2inUUANop1FABRRRQAUUUUAFFFFABRRRQ"
+    "AUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUU"
+    "UAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFF"
+    "FFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFAB"
+    "RRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQ"
+    "AUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUU"
+    "UAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFF"
+    "FFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFAB"
+    "RRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQ"
+    "AUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAtFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFF"
+    "FABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABR"
+    "RRQAUUUUAFFFIWAoAWimGT0FJvNAElFR7z60bz60ASUVHvPrRvPrQBJRUe8+tG8+tAElFR7z60bz60ASUVHvPrRvPrQBJRUe8+tG"
+    "8+tAElFR7z60bz60ASUVHvPrRvPrQBJRUe8+tG8+tAElFR7z60bz60ASUVHvNKJPUUAPopAwNLQAUUUUAFFFFABRRRQAUUUUAFFF"
+    "FABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABR"
+    "RRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQA"
+    "UUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUU"
+    "AFFFFABRRRQAUUUUAFFFFABSEgUE4pmc0ABYn2pKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKK"
+    "WigBKKWigBKKWigBKUMR70UUAPBBpajzing5oAWiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK"
+    "KACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBK"
+    "KWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKOlLT"
+    "WPOKAGnJpMUtFACYoxS0UAJijFLRQAmKMUtFACYoxS0UAJijFLRQAmKMVunwR4iHhP8A4S06TcrofnCAXhXClj0IHUrnjd0zgZzW"
+    "HQAmKMUtFACYoxS0UAJijFLW4vgjxE/hM+LU0m5bQ1mMDXirlVYdSR12543dM8ZoAwsUYpaKAExRilooATFGKWigBMUYpaKAExRi"
+    "looATFKMiiigB/WikU84p1ACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtF"
+    "ACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUU"
+    "tFACUUtFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUA"
+    "FFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUzFPPSm0AJijFLRQAmKMUtFAC"
+    "YoxS0UAJijFLRQAmKMUtFACYre8DXvh/TvFmm3XinT31DRklH2mBWIyv94gfeAOCV/iAIrCooA/RhbbR/EPh9bZIrS90a9tgixoA"
+    "YZYGXgADjbjpjpXxP8ZvhRd/C7xIYYxJPot4WewuW5OO8Tn++v6jB9cdv+zh8Z/+EYvIvB3iC526RdSYsriQ8WczH7hPaNj/AN8s"
+    "fQnH0r438GaX498OXeg6vEWgnGVkUfPBIPuyJ6MD+YyDwanYD88sUYrf8c+CtV8AeJLrQdXjAmhO6OVR8lxEfuyJ7H9CCD0rBqgE"
+    "xRilrd8E+DNV8feI7XQdIiDTznLyMPkgjH3pH/2R+pwByaAOh+Dfwpu/ij4kFu3mQaPZlXv7peCqnpGh/vt29Bk+mftpbTR/DugG"
+    "18m0stHsrYo0bgCGKBV5DZ424znPWqPgbwVpfgDw3a6DpEZEMIy8rD57iQ/ekf8A2ifyGAOBXzf+0h8Z/wDhI7uXwb4fud2k20mL"
+    "64jPF3Kp+4D3jUjn+8w9AMzuB5H48vfD2peLdSuvCuntp+jPKfs0LMTx3YA/dDHJC/wggVgYpaKoBMUYpaKAExRilooATFGKWigB"
+    "MUYpaKAExRilooATFPptOHSgAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAC"
+    "iiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiig"
+    "AooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooo"
+    "oAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAA0lKaTFABRRijFABRRijFABRRijFABRRijFABRRijFABR"
+    "RijFAB14PIr6u/Zv+M//AAkVpF4N8QXJOq2yYsbiRubuJR9wnvIo/wC+lHqDn5RxU1pd3Gn3cN5aTyW9zA6yxSxtho3ByGB7EGhg"
+    "fcfxj+FVn8UfDZt18uDWLQNJYXTdFbvGx/uNjn0OD25+H9S0280fULnTtQtpLW8tZGimhkGGjcdQa+1/gl8W7f4neHyl20cWvWKh"
+    "b2BeBIOgmQf3W7j+E8dMVzX7RXwZ/wCEy09/FGhW4Ou2UX7+FBzfQqOnvIo6eo+X0qUB8madp13q9/b6fYW8l1d3MixQwxjLSOTg"
+    "AV9v/Br4U2fwv8OCF/Ln1m8Cvf3S8gt2jQ/3F/U5Ppjkf2dPgx/wh9gnirXrfGuXkf8Ao8Mg5soWHcdpGHX0HHc11Hxr+LVt8MPD"
+    "2LZo5tdvlZbG3bkJ2Mzj+6vp/EcD1wMDjv2j/jP/AMIzZy+DvD9zt1e6jxe3EZ5s4mH3Qe0jD/vlTnqRXyf04HAqe9vLnUbye8vJ"
+    "5Li5uJGllmkbLSOTksT6k1BiqQBRRijFABRRijFABRRijFABRRijFABRRijFABRRijFABSikxSigAooooAKKKKACiiigAooooAKK"
+    "KKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAC"
+    "iiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAdRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUU"
+    "AFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFF"
+    "FABRRRQAhpKWjFACUUuKMUAJRS4oxQAlFLilAyQAOScD3NADaK7PSPg18Qdct1ubHwjqrQuMq8qCEMPUbypNaH/DP3xP/wChQvP+"
+    "/wBD/wDF0XA88or0P/hn74n/APQoXn/f6H/4uj/hn74n/wDQoXn/AH+h/wDi6LgeeUV6H/wz98T/APoULz/v9D/8XR/wz98T/wDo"
+    "ULz/AL/Q/wDxdFwPPKK9D/4Z++J//QoXn/f6H/4uj/hn74n/APQoXn/f6H/4ui4HKeEvFeqeCfEFprujzeVd2rZAP3JVP3kcd1Yc"
+    "H8+oFfdfw+8eaX8RfDVvrmlttD/JPbscvbSgfNG306g9wQa+P/8Ahn74n/8AQoXn/f6H/wCLrqPAPgf44/DbUpb7QPDVwonUJPbz"
+    "vC8MwHTcvmDkc4IIIyfWkwPpnx/460v4d+GrnXdVYssfyQwKcPcyn7sa+57nsAT2r4U8X+LdU8ceIbvXdYm8y6uW+6v3IkH3Y0HZ"
+    "VHA/E9Sa9T8f+Cfjj8StRhvNe8MzstupWC2geFIYQeu1fMPJ4ySSeBXLf8M/fE//AKFC8/7/AEP/AMXQgPPKK9D/AOGfvif/ANCh"
+    "ef8Af6H/AOLo/wCGfvif/wBChef9/of/AIuncDzyivQ/+Gfvif8A9Chef9/of/i6P+Gfvif/ANChef8Af6H/AOLouB55RXof/DP3"
+    "xP8A+hQvP+/0P/xdH/DP3xP/AOhQvP8Av9D/APF0XA88or0P/hn74n/9Chef9/of/i6oat8GfiFodu1zfeENVWFBlniQTBR6nYWN"
+    "FwOLopxGCQRgg4I9DSYoASilxRigBKKXFGKAEpRRiigBaKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooFLQAlFLRQAlFLRQAmD6E/QV"
+    "9h/Az4Haf4K0u113XbSO58R3CCUeau4WAIyEQH+PH3m654GAOfmz4Q6TDrfxP8MWFyoeF79HdT0YIC+P/HRX3L4h1YaHoGp6uyeZ"
+    "9itZbop/e2IWx+OKTAbrHiTRPD4RtZ1jTtO8z7n2u5SMt9Nxyay/+FmeBv8AocfD3/gfF/jXwfruu6j4o1a41jWLp7u+umLySuc9"
+    "f4R6KOgA4AqjgegosB9/f8LM8Df9Dj4e/wDA+L/Gj/hZngb/AKHHw9/4Hxf418A4HoKMD0FFgPv7/hZngb/ocfD3/gfF/jR/wszw"
+    "N/0OPh7/AMD4v8a+AcD0FGB6CiwH39/wszwN/wBDj4e/8D4v8aP+FmeBv+hx8Pf+B8X+NfAOB6CjA9BRYD7+/wCFmeBv+hx8Pf8A"
+    "gfF/jR/wszwN/wBDj4e/8D4v8a+AcD0FGB6CiwH39/wszwN/0OPh7/wPi/xo/wCFmeBv+hx8Pf8AgfF/jXwDgegowPQUWA+/v+Fm"
+    "eBv+hx8Pf+B8X+NH/CzPA3/Q4+Hv/A+L/GvgHA9BRgegosB9/f8ACzPA3/Q4+Hv/AAPi/wAaP+FmeBv+hx8Pf+B8X+NfAOB6CjA9"
+    "BRYD7+/4WZ4G/wChx8Pf+B8X+NH/AAszwN/0OPh7/wAD4v8AGvgHA9BRgegosB9/f8LM8Df9Dj4e/wDA+L/GtTR/Euh+IN50bWdO"
+    "1Hy+X+yXKSFfrtORX524HoKvaHrmo+GdVt9X0i6e0vrVg8UsZwcjsfVT0IPBFFgPrf44/A7T/HGl3Ot6JaR23iS3QyAxKFF+AMlH"
+    "A/jx91uueDkHj45IIOCCD6EYIr9E/Desf2/4d0vWRH5X260hutg/hLoGx+BNfD/xj0mHRPil4nsbZQkK3zSIq9FDgSYH4saEBxlF"
+    "LRTASilooASilpDQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUU"
+    "UAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFLRQAlFLRQAlFLRQA"
+    "lFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLR"
+    "QAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQAlFLRQACjFKKKAExRilooATFGKWigDvfgMP+Lwe"
+    "Fv8Ar7b/ANFPX2J8RP8Akn3ib/sE3X/opq+O/gN/yV/wv/19t/6KevsT4if8k+8S/wDYKuv/AEU1Jgfn6o+UfSjFC/dH0paYCYox"
+    "S0UAJijFLRQAmKMUtFACYoxS0UAJijFLRQAmKMUtFACYoxS0UAJijFLRQAmKCOD9KWg9D9KAPv74a/8AJOfC/wD2CbX/ANFLXyD8"
+    "fh/xeHxP/wBfKf8AomOvr74a/wDJOfDH/YJtf/RS18g/H3/ksPif/r4T/wBEx1K3A8+xRiloqgExRilooATFBpaDQA2ilooASilo"
+    "oASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooASi"
+    "looASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooASilooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAFWlxSLTqAExRilooATFGKWigDvPgOP+Lv8Ahf8A6+m/9FPX2H8RP+SfeJf+"
+    "wVdf+imr49+A/wDyV/wv/wBfTf8Aop6+wviJ/wAk+8S/9gq6/wDRTUmB+fyj5R9KXFC/dH0paYCYoxS0UAJijFLRQAmKMUtFACYo"
+    "xW14f8Kah4hctAoit1OGnk+6D6D1NdrafDHSYkH2m4urh+5DBB+QH9a5K2No0nyyep7OAyDG42PPSjaPd6L/ADPMMUYr028+GGmS"
+    "ofsl1c279txDr+XB/WuI17w1qHh6ULdIGic4SaPlG9vY+xp0cbSrO0XqLH5FjMFHnqx93utV/wAD5mTijFLRXUeOJijFLRQAmKMU"
+    "tFACYoI4P0paQ9D9KAPv34bf8k58Mf8AYJtf/RS18hfH3/ksPif/AK+E/wDRMdfX3w2/5Jz4Y/7BNr/6KWvkH4+/8lh8T/8AXwn/"
+    "AKJjqUB5/ijFLRVAJijFLRQAmKRqdTWoASiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAcnenU1O9OxQAUUYoxQAUUYoxQB3vwH/5K/4X"
+    "/wCvpv8A0U9fYPxE/wCSfeJf+wVdf+imr4++A4/4u94X/wCvpv8A0U9fYPxE/wCSfeJf+wVdf+impMD4AX7o+lLQo+UfSjFMAoox"
+    "RigAooxRigArS8PaO+u6tBZAlUY7pGH8KDqf6fjWbiu6+FkCm61Cc43LGiD6Ekn+QrnxVV06Uprc9PJ8JHF42nQns3r6LX9Dv7W2"
+    "hsreO3t41jijXaiL0AqSiivkm76s/aYxUUox2QVBfWNvqVpJaXUYkhkGGB/mPep6KE2ndCnCM4uMldM8P1nTJNG1O4sZTuMTYVv7"
+    "ynkH8qpV2XxPhVNYtZVADSW+G98McfzrjcV9dhqjqUozfU/E80wqwuLqUI7J6em6/AKKMUYrc4AooxRigApD0P0pcUEcH6UAffnw"
+    "2/5J14Y/7BNr/wCilr5C+Pn/ACWDxP8A9fCf+iY6+vfht/yTrwx/2CbX/wBFLXyH8fB/xeDxP/18J/6JjqUB5/RRijFUAUUYoxQA"
+    "U1+1OxTX7UANooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK"
+    "KACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAWiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigByd6dSJ3p2KAEopcUYoASilxRigDvPgR/yV7wv/wBfTf8Aop6+wfiH/wAk"
+    "+8S/9gq6/wDRTV8f/Aj/AJK94X/6+m/9FPX2B8Q/+Sf+Jf8AsFXX/opqTA+AF+6PpS0KPlH0pcUwEopcUYoASilxRigBK634bail"
+    "rrUlrI2BdR7V/wB5eQPyzXJ4p8UrwSpLE5SRGDKw6qR0NZV6Sq03B9Tsy/FvCYmGIX2X+HX8D3iiuc8L+MbXXIUgndIL4DDRk4En"
+    "uv8Ah2ro6+Sq0pU5cs1qftGExlLFUlVoyun/AFqFFFcv4r8aW+kQva2UiTXzDHy8rD7n39vzp0qMqsuWCFjMbRwlJ1a0rJfj5LzO"
+    "R+IWopfeIWjjIK2qCHI/vdW/nj8K5mnMS7FmJZmOSSeSfWkxX1tGmqcFBdD8WxuKliq868t5O4lFLijFaHKJRS4oxQAlB6H6UuKC"
+    "OD9KAPvr4bf8k68Mf9gq1/8ARS18h/Hv/ksHif8A6+E/9Ex19efDf/knXhj/ALBVt/6KWvkT49j/AIu/4m/6+E/9Ex1KA8/opcUY"
+    "qgEopcUYoASmv2p+Ka/agBlFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUU"
+    "UAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFF"
+    "FFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFAB"
+    "RRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQA+PvT6bF3p9ACUUtFACUUtFAHd/An/kr3hf/AK+m/wDRT19g"
+    "fEP/AJJ/4l/7BV1/6KavkD4E/wDJXfDH/X03/op6+v8A4h/8k/8AEv8A2Crr/wBFNSYHwEv3R9KWhfuj6UtMBKKWigBKKWigBKKW"
+    "igBK1rTxXrlkgSHUp9o4Ach8f99A1lUVMoRnpJXNaOIq0XzUpOL8m1+Rp3nijWr9Ck+pXBQ9VUhAf++cVl4paKIwjFWirBVr1Kz5"
+    "qsnJ+bv+YlFLRVGQlFLRQAlFLRQAlIeh+lOpD0P0oA++fhv/AMk68Mf9gq2/9FLXyL8e/wDkr/ib/r4T/wBEx19dfDf/AJJ34Z/7"
+    "BVt/6KWvkX49f8lf8Tf9fCf+iUqUBwFFLRVAJRS0UAJTJO1SUyXtQBHRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFF"
+    "FABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABR"
+    "RRQAUUUUAFFFFABRRRQAUU6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6i"
+    "gBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFO"
+    "ooAbRTqKAG0U6igB0XepMUyLvT6ADFGKKKADFGKKKAO7+BI/4u74Y/6+m/8ART19f/EL/kn/AIl/7BV1/wCimr5B+BX/ACV3wx/1"
+    "9N/6Kevr74ggnwB4kAGT/ZV1/wCimpMD4EUfKPpS4pF+6PpS0wDFGKKKADFGKKKADFGKKKADFGKKKADFGKKKADFGKKKADFGKKKAD"
+    "FGKKKADFIRwfpS0HoaAPvf4b/wDJO/DH/YKtv/RS18jfHof8Xf8AE3/Xwn/olK+uvhwCPh54ZBGD/ZVr/wCilr5G+PX/ACV7xN/1"
+    "8J/6KSpW4HAYoxRRVAGKMUUUAGKjl7VJTJe1AEVFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOoo"
+    "AbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTq"
+    "KAG0U6igBtFOooAbRTqKAG0U6igBtFOooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKK"
+    "KKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAH"
+    "xd6kxTIe9SUAJijFLRQAmKMUtFAGv4P19vCvirSNdVS/9n3cc7KOrKD8w/FSRX3xBNY67paTQtHd2F9BuUjlZYnX+RBr88K9a+D/"
+    "AMer34eQrourwS6joO4mNUI860JOTszwynrtOOeQR0pNAW/Gf7MPizStVlPhiGLV9LdiYf36xzRL2Vw5AOOm4Hn0Fc9/wz38TP8A"
+    "oWH/APAqD/4uvpzSvjf8O9XgWWLxXp9uSMmO8JgdfYhgP0zV/wD4Wt4B/wChz0D/AMDFpXA+VP8Ahnv4mf8AQsP/AOBUH/xdH/DP"
+    "fxM/6Fh//AqD/wCLr6r/AOFreAf+hz0D/wADFo/4Wt4B/wChz0D/AMDFouB8qf8ADPfxM/6Fh/8AwKg/+Lo/4Z7+Jn/QsP8A+BUH"
+    "/wAXX1X/AMLW8A/9DnoH/gYtH/C1vAP/AEOegf8AgYtFwPlT/hnv4mf9Cw//AIFQf/F0f8M9/Ez/AKFh/wDwKg/+Lr6r/wCFreAf"
+    "+hz0D/wMWj/ha3gH/oc9A/8AAxaLgfKn/DPfxM/6Fh//AAKg/wDi6P8Ahnv4mf8AQsP/AOBUH/xdfVf/AAtbwD/0Oegf+Bi0f8LW"
+    "8A/9DnoH/gYtFwPlT/hnv4mf9Cw//gVB/wDF0f8ADPfxM/6Fh/8AwKg/+Lr6r/4Wt4B/6HPQP/AxaP8Aha3gH/oc9A/8DFouB8qf"
+    "8M9/Ez/oWH/8CoP/AIuj/hnv4mf9Cw//AIFQf/F19V/8LW8A/wDQ56B/4GLR/wALW8A/9DnoH/gYtFwPlT/hnv4mf9Cw/wD4FQf/"
+    "ABdH/DPfxM/6Fh//AAKg/wDi6+q/+FreAf8Aoc9A/wDAxaP+FreAf+hz0D/wMWi4Hyp/wz38TP8AoWH/APAqD/4uj/hnv4mf9Cw/"
+    "/gVB/wDF19V/8LW8A/8AQ56B/wCBi0f8LW8A/wDQ56B/4GLRcD5U/wCGe/iZ/wBCw/8A4FQf/F10Hg39mHxbquqRf8JLDFo+mKwM"
+    "x89JJpV7qioSAT03E8e9fRf/AAtbwD/0Oegf+Bi1R1X43fDvSIGll8V6dcEDIjtGM7t7AKD+uKLgddJJY6HpbPI0dpYWMGWJOFhi"
+    "Rf5BRXwT4z8QHxZ4t1fXipUX93JOinqqE4UfgoFehfGD493vxBgfRdHgm07Qt2ZBIR515g5G/HCqDztBOT1PavJKaQCYoxS0UwEx"
+    "RilooATFRy9qlqObtQBHRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFAB"
+    "RRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQ"
+    "AUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUU"
+    "UAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUASQ/wAVS1FD94j2qXFABRRijFABRRijFABRRijFABmijFGKACij"
+    "FGKACijFGKACijFGKACijFGKACijFGKACijFGKACijFGKACijFGKACjJoxRigAooxRigAooxRigAooxRigAqKb+GpcVFN94D2oAj"
+    "ooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAoooo"
+    "AKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAWiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigB0Zw4qeq1WUIZQaACilxRigBKKXFGKAEopcUYoASilxRigBKKXFGKAEopcUYoASilxRigB"
+    "KKXFGKAEopcUYoASilxRigBKKXFGKAEopcUYoASilxRigBKKXFGKAEopcUYoASilxRigBKgkOXNTuQqk1WoAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKK"
+    "ACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAp8T7Tg9DTKKALdFRwybhtJ5/nUtACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUU"
+    "tFACUUtFACUUtFACUUtFACUUtFACUUtRTSbRtB5/lQBHK+44HQUyiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigA"
+    "ooooAKKKKACiiigAooooAKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBK"
+    "KWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWig"
+    "BKKWigBKKWigBOlTxzZ4bj3qGigC3ijFV0lZOOo9KmWZW6nB96AHYoxS9aKAExRilooATFGKWigBMUYpaKAExRilooATFGKWigBM"
+    "UYpaKAExRilooATFGKWigBMUYpaKAExRilooATFGKWjpQAmKMU1plXocn2qF5WfjoPSgB8k2OF596g60tFACUUtFACUUtFACUUtF"
+    "ACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUU"
+    "tFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFACUUtFABRRRQAUUUUAFFFFABRRRQAUUU"
+    "UAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFF"
+    "FFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAoJHQkU4SuP4jTKKAH+c/wDe/Sjzn/vfpTKKAH+c/wDe"
+    "/Sjzn/vfpTKKAH+c/wDe/Sjzn/vfpTKKAH+c/wDe/Sjzn/vfpTKKAH+c/wDe/Sjzn/vfpTKKAH+c/wDe/Sjzn/vfpTKKAH+c/wDe"
+    "/Sjzn/vfpTKKAH+c/wDe/Sjzn/vfpTKKAH+c/wDe/Sjzn/vfpTKKAH+c/wDe/Sjzn/vfpTKKAHmVz/EaaST1JNJRQAUUUUAFFFFA"
+    "BRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRR"
+    "QAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUU"
+    "UUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAF"
+    "FFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFA"
+    "BRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRR"
+    "QAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQA6i"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigA"
+    "ooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiuo+Hnw81X4l61No+kXFlBcQ"
+    "2zXTNduyoVDKpAKqxzlx29aAOXor2v8A4ZM8cf8AQV8N/wDgRN/8ao/4ZM8cf9BXw3/4ETf/ABqi4HilFe1/8MmeOP8AoK+G/wDw"
+    "Im/+NVxkfwi1qT4jS+AG1DSY9WjUESvLIIHPlCXarbN2dp7qOhouBw9Feg/EP4IeJfhrpMGq6tcaZc200wt82ckjlGKkjduRcA7T"
+    "Xn1ABRU1lZzaheQWdshknuJFijQdWZjgD8zXqXiT9mzxX4V0G+1vUdW8PC1sojNIEnmLNjoqgxAZJwBkjk0AeT0UUUAFFery/s2+"
+    "LovDD+I21HQjaJZG/KCaXzPLEe/GPLxux74z3ryigAoor034IfCO2+Kd/qR1DUJrOy05Y96wAebIz7sAEggAbDk4PagDzKiu5+MP"
+    "w3T4Y+K00mC+a8tri3W6hdwBIqlmXa2OM5U8jrW3of7OPizX/DNr4itdR0NLS5t/tKJLNKJAuM4IEZGfxoA8rooooAKKKKACiiig"
+    "AooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooo"
+    "oAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKK"
+    "KKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAC"
+    "iiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACuh8D+O9Z+HurS6robwJcywNbMZow42FlY8eu"
+    "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"
+    "We4uGBluZMdgOpwAAoH9TTbA8A/aueJ/iVaLGRuTSohJj+95kp/kRXvnxBYr8GNYIJB/sVhx/wBc6+P/AIgeL5/Hfi/UdfmQxi6k"
+    "/dRE58uNQFRfrgDPvmvsD4hf8kY1j/sDH/0WKGB8O19k/sztC3wnsRHjetzcCTH97eT/ACK18b17R+zr8WrLwTeXPh/XZxBpV/IJ"
+    "Yrhvu282Ap3eisAoJ7bR2JIGB3us/FH4KWOr31pqPg21a9guJIrhm0SBiZFYhiSepyDzS6V8dfg3oNybrSfDp064KlDNaaTDE5U4"
+    "JGVIOOBx7Vq+Pv2efDvxE1JvEOl6u2mXF4BJLJBGs8E5x98AEcnuQcHr1ySvhf4F+BPhrpt5qHia5s9WDptkuNTiRYYl6/IhJwxx"
+    "1yT2GOcoDxL49/ETQviPrmmX+hi6C21qYZTcRhDneSMcn1NeX11HxH1Tw3q/iy6n8J6WmnaQgEcKLkebjrIQSduT0HoBxnNcxVAJ"
+    "RS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0U"
+    "AJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAJRS0UAFFF"
+    "FABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABR"
+    "RRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABW7c+PPFt5ZyWVz4p12e1k"
+    "QxvBJfytG6YxtKlsEY7VhUUAFFFFABW3p3jfxVpFnHZab4m1uytYs7ILe+ljjTJJOFVgBkkn8axKKALmqaxqWuXX2vVdQvNQudoX"
+    "zrqZpXwOg3MScVToooAKKKKAOhh+InjO3hSGHxd4hiijUIiJqMwVVAwAAG4Ap3/CyvHH/Q5eJP8AwZzf/FVzlFAHQT/EPxldQSQT"
+    "+LfEE0MqlHjk1GZldSMEEFsEEdqz9I8Raz4eeR9G1fUNNeUASNZ3DwlwOgO0jNZ9FAFzVdZ1PXbr7Xq2o3moXO0J511M0r7R0G5i"
+    "Tjk8Vft/HPiu0sVsLfxPrkNmieWtvHfSrGqdNoUNgD2rEooAu6ZreqaJKZtL1K9sJG6vaztEx/FSKTU9Z1PWphNqmo3l/KBgPczN"
+    "Kw/Fiap0UAFblx478WXdk9jc+KNcmtJE8t7eS/laNkxjaVLYI9qw6KACiiigDT0vxPruhqU0rWtT09SckWt08QJ/4CRUWqa7q2tu"
+    "smq6pfag6/da6naUj6Fiao0UAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQA"
+    "UUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUU"
+    "AFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFF"
+    "FABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABR"
+    "RRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQA"
+    "UUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUU"
+    "AFFFFABRRRQAUUUUAFFFFABRRRQAUUUUALRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRR"
+    "RQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAU"
+    "UUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUA"
+    "FFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFF"
+    "ABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRR"
+    "RQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAU"
+    "UUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUA"
+    "FFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFF"
+    "ABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUUUUAFFFFABRRRQAUU6igBtFOooAb"
+    "RTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKA"
+    "G0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6i"
+    "gBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFO"
+    "ooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbR"
+    "TqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAbRTqKAG0U6igBtFOooAKKKKACi"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigA"
+    "ooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAoooo"
+    "AKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK"
+    "KACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigA"
+    "ooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAoooo"
+    "AKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK"
+    "KACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKAFooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKK"
+    "ACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKK"
+    "ACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACii"
+    "igAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAo"
+    "oooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA"
+    "KKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWi"
+    "gBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKK"
+    "WigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigB"
+    "KKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWi"
+    "gBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigBKKWigAooooAKKKKACiiigAoooo"
+    "AKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK"
+    "KACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigA"
+    "ooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAoooo"
+    "AKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKK"
+    "KACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACi"
+    "iigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigA"
+    "ooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAoooo"
+    "AKKKKACiiigAooooAKKKKACiiigAooooA//Z"
+)
+
+
+def idle_clip():
+    """Morceau d'une seconde « écran TV Libre », fabriqué une fois (même format que les logos de chaîne)"""
+    p = os.path.join(LOGO_DIR, "tvlibre-ecran.ts")
+    if os.path.exists(p):
+        return p
+    import base64
+    os.makedirs(LOGO_DIR, exist_ok=True)
+    img, tmp = p + ".jpg", p + ".tmp.ts"
+    with open(img, "wb") as f:
+        f.write(base64.b64decode(IDLE_JPEG_B64))
+    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-loop", "1", "-framerate", "25",
+                    "-i", img, "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", "1", "-vf", "format=yuv420p",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-g", "25", "-c:a", "aac", "-b:a", "64k", "-shortest",
+                    "-f", "mpegts", tmp], capture_output=True, timeout=60)
+    if os.path.exists(tmp) and os.path.getsize(tmp) > 1000:
+        os.replace(tmp, p)
+    return p if os.path.exists(p) else None
+
+
+class IdleSession:
+    """Écran TV Libre entre deux lectures (flèche vers le bas dans l'app) : direct sans fin du même morceau,
+    l'Apple TV reste dans son lecteur au lieu de revenir à l'accueil. Arrêt de lui-même au bout de 10 min."""
+    SHOW = 8
+    MAX_AGE = 600
+
+    def __init__(self, sid):
+        self.t0 = time.time()
+        self.clip = idle_clip()
+        if not self.clip:
+            raise IOError("écran TV Libre impossible à fabriquer")
+        with open(self.clip, "rb") as f:
+            self.data = f.read()
+
+    def get(self, name):
+        if name == "idle.m3u8":
+            age = time.time() - self.t0
+            last = int(min(age, self.MAX_AGE)) + self.SHOW
+            first = last - self.SHOW
+            # Chaque morceau repart à zéro : rupture devant chacun, et le compteur des ruptures suit celui des morceaux
+            out = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:1",
+                   "#EXT-X-MEDIA-SEQUENCE:%d" % first, "#EXT-X-DISCONTINUITY-SEQUENCE:%d" % first]
+            for i in range(first, last):
+                out += ["#EXT-X-DISCONTINUITY", "#EXTINF:1.000,", "e%d.ts" % i]
+            if age > self.MAX_AGE:
+                out.append("#EXT-X-ENDLIST")          # l'Apple TV termine et revient à l'accueil
+            return ("\n".join(out) + "\n").encode(), "application/vnd.apple.mpegurl"
+        if re.fullmatch(r"e\d+\.ts", name):
+            return self.data, "video/mp2t"
+        raise KeyError(name)
+
+    def close(self):
+        pass
 
 
 class TVSession:
@@ -1295,25 +1681,30 @@ class TVSession:
                 self._append("fill_%d.ts" % self.fillers, 1.0, clip, True)
         src = os.path.join(self.dir, "src%d" % gen)
         os.makedirs(src, exist_ok=True)
-        # Niveau sonore égalisé d'une chaîne à l'autre : gain appris aux visionnages précédents,
-        # son principal réencodé (les autres langues restent telles quelles). Trop chaud ou échecs : copie simple.
+        # Son égalisé flux par flux (éteint par défaut, voir Loudness) ; trop chaud ou échecs : copie simple
         key = LOUDNESS.key(url)
-        level = Loudness.ENABLED and not is_hot() and getattr(self, "fails", 0) < 2
-        gain = LOUDNESS.gain(key) if level else 0.0
-        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info" if level else "warning",
+        gain, measure = LOUDNESS.plan(key)
+        if is_hot() or getattr(self, "fails", 0) >= 2:
+            gain, measure = None, False
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "info" if measure else "warning",
                "-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
                "-reconnect_delay_max", "4", "-rw_timeout", "15000000",
                "-fflags", "+genpts+discardcorrupt", "-i", url,
                "-map", "0:v:0?", "-map", "0:a?", "-c", "copy"]
-        if level:
+        if gain is not None:
+            # aresample=async : le son réencodé reste calé sur l'horloge de l'image (pas de décalage qui se creuse)
             cmd += ["-c:a:0", "aac", "-b:a:0", "160k", "-ar:a:0", "48000",
-                    "-filter:a:0", "volume=%.1fdB,ebur128=framelog=info" % gain]
+                    "-filter:a:0", "aresample=async=1000,volume=%.1fdB" % gain]
+            zlog("  son du flux", key, "corrigé de %+.1f dB" % gain)
         cmd += ["-sn", "-dn", "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
                 "-hls_flags", "delete_segments+independent_segments+omit_endlist+temp_file",
                 "-hls_segment_filename", os.path.join(src, "seg_%06d.ts"), os.path.join(src, "live.m3u8")]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE if level else subprocess.DEVNULL)
-        if level:
-            threading.Thread(target=LOUDNESS.listen, args=(proc, key, gain), daemon=True).start()
+        if measure:
+            # Mesure à côté, sur une copie du son décodée et jetée : le flux envoyé n'est pas touché
+            cmd += ["-map", "0:a:0?", "-t", "75", "-af", "ebur128=framelog=info", "-f", "null", "-"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE if measure else subprocess.DEVNULL)
+        if measure:
+            threading.Thread(target=LOUDNESS.listen, args=(proc, key), daemon=True).start()
         with self.lock:
             self.proc, self.src, self.url, self.first = proc, (gen, src), url, True
         # Anciennes sources : effacées quand plus aucun de leurs morceaux n'est dans la liste
@@ -1603,7 +1994,7 @@ class Sessions:
         if time.time() < self.remote_busy_until:
             return True
         with self.lock:
-            return any(v[2] != "local" for v in self.items.values())
+            return any(v[2] not in ("local", "idle") for v in self.items.values())
 
     def describe(self):
         with self.lock:
@@ -2328,6 +2719,26 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/vod/open":
                 return self.vod_open(q["u"], q.get("ext", "mkv").lower(), float(q.get("start", "0") or 0),
                                      float(q.get("gain", "-5") or -5))
+            if u.path == "/loudness":
+                changed = False
+                for k in ("on", "measure"):
+                    if k in q:
+                        setattr(LOUDNESS, k, q[k] in ("1", "true", "oui"))
+                        changed = True
+                if "forget" in q:
+                    with LOUDNESS.lock:
+                        LOUDNESS.levels.pop(q["forget"], None)
+                    changed = True
+                if changed:
+                    LOUDNESS.save()
+                    log("égalisation du son :", "corrige" if LOUDNESS.on else "ne corrige pas", "/",
+                        "mesure" if LOUDNESS.measure else "ne mesure pas")
+                return self.js(LOUDNESS.describe())
+            if u.path == "/idle/open":
+                # Écran TV Libre : ferme la lecture en cours (connexion du compte libérée) et boucle le logo de l'app
+                sid, _ = SESSIONS.open("idle", lambda sid: IdleSession(sid))
+                zlog("ÉCRAN TV LIBRE (flèche vers le bas)")
+                return self.js({"id": sid, "url": "/s/%s/idle.m3u8" % sid})
             if u.path == "/tv/trace":
                 n = int(q.get("n", "400") or 400)
                 return self.send(200, ("\n".join(list(ZAPLOG)[-n:]) + "\n").encode(), "text/plain; charset=utf-8")
