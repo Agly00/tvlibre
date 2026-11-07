@@ -22,7 +22,7 @@ import collections, json, math, os, re, shutil, socket, struct, subprocess, sys,
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -2714,7 +2714,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             n = int(self.headers.get("Content-Length") or 0)
             d = json.loads(self.rfile.read(min(n, 10000)) or b"{}")
-            cfg = {"server": str(d["server"]).rstrip("/"), "username": str(d["username"]), "password": str(d["password"])}
+            cfg = {"server": str(d["server"]).rstrip("/"), "username": str(d["username"]), "password": str(d["password"]),
+                   "fallback": [str(x) for x in (d.get("fallback") or []) if str(x).startswith("http")][:4]}
         except Exception:
             return self.js({"error": "compte incomplet"}, 400)
         try:

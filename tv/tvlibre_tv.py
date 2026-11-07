@@ -116,9 +116,10 @@ class Catalog(QObject):
     epgReady = Signal(str)
     status = Signal(str)
 
-    def __init__(self, xt, demo=False):
+    def __init__(self, xt, demo=False, fallback=()):
         super().__init__()
         self.xt, self.demo = xt, demo
+        self.fallback = list(fallback)
         self._groups, self._channels, self._flat = [], {}, []
         self._movie_rows, self._series_rows = [], []
         self._epg = {}
@@ -154,6 +155,7 @@ class Catalog(QObject):
             flat.append({"name": name, "country": lineup.country_of(cats.get(str(st.get("category_id")), ""), name),
                          "xtream": True, "id": str(st.get("stream_id")), "logo": st.get("stream_icon") or "",
                          "archive_days": int(st.get("tv_archive_duration") or 0) if str(st.get("tv_archive")) == "1" else 0})
+        flat += self._load_fallback()
         self._set_lineup(lineup.build(flat))
         self.changed.emit()
         vcats = {str(c["category_id"]): c.get("category_name") for c in (self.xt.api("get_vod_categories") or [])}
@@ -173,6 +175,28 @@ class Catalog(QObject):
             srows.setdefault(str(s.get("category_id")), []).append({
                 "id": str(s.get("series_id")), "name": s.get("name") or "", "poster": s.get("cover") or "", "kind": "series"})
         self._series_rows = [{"title": scats.get(k, "Séries"), "items": v[:40]} for k, v in list(srows.items())[:12]]
+
+    def _load_fallback(self):
+        """Liste Netplus (M3U) : repli pour les chaînes de la grille"""
+        out = []
+        for url in self.fallback:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": UA})
+                text = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "replace")
+            except Exception:
+                continue
+            info = None
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("#EXTINF"):
+                    info = line
+                elif line and not line.startswith("#") and info:
+                    attrs = dict(re.findall(r'([A-Za-z0-9\-]+)="([^"]*)"', info))
+                    name = info.rsplit(",", 1)[-1].strip()
+                    out.append({"name": name, "country": lineup.country_of(attrs.get("group-title", ""), name),
+                                "xtream": False, "url": line, "logo": attrs.get("tvg-logo", "")})
+                    info = None
+        return out
 
     def _load_demo(self):
         rnd = random.Random(4)
@@ -213,10 +237,11 @@ class Catalog(QObject):
             lst = []
             for c in chans:
                 num += 1
-                st = [{"id": x["id"], "archive_days": x.get("archive_days", 0)} for x in c["streams"] if x.get("id")]
+                st = [{"id": x.get("id", ""), "url": x.get("url", ""), "archive_days": x.get("archive_days", 0)}
+                      for x in c["streams"] if x.get("id") or x.get("url")]
                 if not st:
                     continue
-                ch = {"id": st[0]["id"], "streams": st, "name": c["name"], "logo": c.get("logo", ""), "num": num,
+                ch = {"id": st[0]["id"] or st[0]["url"], "url": st[0]["url"], "streams": st, "name": c["name"], "logo": c.get("logo", ""), "num": num,
                       "kind": "live", "group": title, "archive": max(x["archive_days"] for x in st),
                       "hue": rnd.random() if rnd else 0.6}
                 lst.append(ch)
@@ -449,7 +474,7 @@ class Player(QObject):
         if it["kind"] == "replay":
             return self.xt.timeshift_url(it["id"], it["start"], it["stop"])
         if it["kind"] == "live":
-            return self.xt.live_url(it["id"])
+            return it.get("url") or self.xt.live_url(it["id"])
         if it["kind"] == "movie":
             return self.xt.movie_url(it["id"], it.get("ext"))
         return self.xt.episode_url(it["id"], it.get("ext"))
@@ -458,6 +483,7 @@ class Player(QObject):
     def play(self, it):
         it = dict(it)
         self._item, self._playing, self._paused = it, True, False
+        self.since = time.time()
         self._pos, self._dur = 0.0, 0.0
         start = 0.0
         if it["kind"] in ("movie", "episode"):
@@ -487,9 +513,9 @@ class Player(QObject):
         tried = it.setdefault("_tried", 1)
         if it.get("kind") == "live" and tried < len(st):
             it["_tried"] = tried + 1
-            it["id"] = st[tried]["id"]
+            it["id"], it["url"] = st[tried]["id"], st[tried]["url"]
             if self.mpv:
-                self.mpv.play(self.xt.live_url(it["id"]))
+                self.mpv.play(it["url"] or self.xt.live_url(it["id"]))
 
     @Slot()
     def stop(self):
@@ -597,27 +623,45 @@ def register_video_item():
 
 class Remote(QObject):
     key = Signal(str)
+    playRequest = Signal("QVariantMap")
+    stopRequest = Signal()
 
 
-def serve_remote(remote, port=8091):
-    """GET /key?k=up|down|left|right|ok|back|play|menu : les mêmes touches que la télécommande"""
+def serve_remote(remote, player, port=8091):
+    """Commandes de l'iPhone à la maison :
+    /key?k=up|down|left|right|ok|back|play|menu   touches de la télécommande
+    /state                                         la télé lit-elle ? (priorité à la télé sur le compte)
+    /play?kind=live&stream=…  /play?kind=movie|episode&id=…&ext=…   « Regarder sur la télé »
+    /stop                                          « Arrêter la télé et regarder ici »"""
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
+
+        def reply(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             q = dict(urllib.parse.parse_qsl(u.query))
             if u.path == "/key" and q.get("k") in ("up", "down", "left", "right", "ok", "back", "play", "menu"):
                 remote.key.emit(q["k"])
-                body, code = b'{"ok":true}', 200
-            else:
-                body, code = b'{"error":"inconnu"}', 404
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+                return self.reply(200, {"ok": True})
+            if u.path == "/state":
+                it = player._item or {}
+                return self.reply(200, {"playing": player._playing, "name": it.get("name"), "kind": it.get("kind"),
+                                        "since": getattr(player, "since", 0)})
+            if u.path == "/stop":
+                remote.stopRequest.emit()
+                return self.reply(200, {"ok": True})
+            if u.path == "/play" and q.get("kind") in ("live", "movie", "episode"):
+                remote.playRequest.emit(q)
+                return self.reply(200, {"ok": True})
+            self.reply(404, {"error": "inconnu"})
 
     srv = ThreadingHTTPServer(("0.0.0.0", port), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -645,15 +689,15 @@ def main():
     app = QGuiApplication(sys.argv)
     app.setApplicationName("TV Libre")
 
-    xt = None
+    xt, cfg = None, {}
     if not args.demo:
         cfg = json.load(open(CONFIG))
         xt = Xtream(cfg["server"], cfg["username"], cfg["password"])
-    catalog = Catalog(xt, demo=args.demo)
+    catalog = Catalog(xt, demo=args.demo, fallback=cfg.get("fallback", []) if not args.demo else ())
     player = Player(xt, demo=args.demo)
     remote = Remote()
     if not args.shot:
-        serve_remote(remote)
+        serve_remote(remote, player)
 
     if not args.demo:
         Video = register_video_item()

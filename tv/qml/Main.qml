@@ -52,7 +52,34 @@ Window {
         function onEpgReady(sid) { epgTick++ }
         function onGuideReady(sid) { guideTick++ }
     }
-    Connections { target: remote; function onKey(k) { handle(k) } }
+    Connections {
+        target: remote
+        function onKey(k) { handle(k) }
+        // « Regarder sur la télé » depuis l'iPhone
+        function onPlayRequest(q) {
+            if (q.kind === "live") {
+                var all = catalog.allChannels
+                for (var i = 0; i < all.length; i++)
+                    for (var j = 0; j < all[i].streams.length; j++)
+                        if (all[i].streams[j].id === q.stream) { playLive(all, i); return }
+                player.play({ kind: "live", id: q.stream, name: q.name || "" }); mode = "live"; showBanner()
+            } else {
+                player.play({ kind: q.kind, id: q.id, ext: q.ext, name: q.name || "" }); mode = "vod"; showBanner()
+            }
+        }
+        function onStopRequest() { player.stop(); mode = "menu" }
+    }
+
+    // Reprendre l'émission en cours à son début (replay du serveur)
+    function startOver(ch) {
+        if (!ch || !(ch.archive > 0)) { showToast("Pas de replay sur cette chaîne"); return false }
+        var l = catalog.guide(ch.id), now = Date.now() / 1000
+        for (var i = 0; i < l.length; i++) if (l[i].start <= now && l[i].stop > now) {
+            player.playReplay(ch, l[i].start, l[i].stop, l[i].title); mode = "vod"; showBanner(); return true
+        }
+        showToast("Programme en cours de chargement, réessaie dans un instant")
+        return false
+    }
 
     onGroupIndexChanged: { groupChannels = catalog.channels(groupIndex); gridIndex = 0 }
 
@@ -96,7 +123,9 @@ Window {
             if (n < 2) return
             groupIndex = (groupIndex + (k === "left" ? -1 : 1) + n) % n
             playLive(catalog.channels(groupIndex), 0)
-        } else if (k === "ok" || k === "play") {
+        } else if (k === "play") {
+            startOver(liveList[liveIndex])
+        } else if (k === "ok") {
             bannerVisible ? bannerTimer.stop() : null
             bannerVisible = !bannerVisible
         } else if (k === "back" || k === "menu") {
@@ -192,7 +221,10 @@ Window {
         else if (k === "ok") {
             var ch = catalog.allChannels[guideRow], hit = guideProg(guideRow, guideCursor), now = Date.now() / 1000
             if (!ch) return
-            if (!hit || (hit.p.start <= now && hit.p.stop > now)) { playLive(catalog.allChannels, guideRow) }
+            if (!hit || (hit.p.start <= now && hit.p.stop > now)) {
+                // Émission en cours : reprise à son début si la chaîne a le replay, sinon le direct
+                if (!(hit && ch.archive > 0 && startOver(ch))) playLive(catalog.allChannels, guideRow)
+            }
             else if (hit.p.archive) { player.playReplay(ch, hit.p.start, hit.p.stop, hit.p.title); mode = "vod"; showBanner() }
             else if (hit.p.start > now) { showToast(catalog.record(ch.id, hit.p.start, hit.p.stop, hit.p.title) + " : " + hit.p.title) }
         }
@@ -570,7 +602,7 @@ Window {
             }
             Text {
                 anchors.right: parent.right; anchors.rightMargin: 36; anchors.top: parent.top; anchors.topMargin: 30
-                text: "▲▼ chaîne   ◀▶ groupe"; color: dim; font.pixelSize: 20
+                text: "▲▼ chaîne   ◀▶ groupe   ▶❙❙ au début"; color: dim; font.pixelSize: 20
             }
         }
 
