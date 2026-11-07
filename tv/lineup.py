@@ -89,6 +89,13 @@ def country_of(category, name):
     return "other"
 
 
+def is_event(c):
+    """Emplacements d'événements (« Next | 2026-11-07 | … », « - EVENT 12 - », « FFF TV 3 PPV ») : masqués"""
+    n = unicodedata.normalize("NFKC", c["name"])
+    return (n.count("|") >= 2 or re.search(r"^\W*(next|live)\s*\||^\W*event\s*\d|^\W*no event|\bppv\b", n, re.I) is not None
+            or re.search(r"EVENT|EVENEMENT|EVENMENT|ÉVÉNEMENT|PPV|EQUIPE LIVE", c.get("group", ""), re.I) is not None)
+
+
 def is_reunion(c):
     """Réunion (catégorie ou nom) : seulement en secours des chaînes gardées"""
     t = fold(c.get("group", "") + " " + c["name"])
@@ -121,7 +128,7 @@ def build(channels, excluded=(), moved=None, merged=None):
                     break
             if placed:
                 break
-        if placed or cc not in DEF["themes"]["countries"] or not c.get("xtream") or is_reunion(c):
+        if placed or cc not in DEF["themes"]["countries"] or not c.get("xtream") or is_reunion(c) or is_event(c):
             continue
         t = text(c["name"])
         for g in DEF["themes"]["groups"]:
