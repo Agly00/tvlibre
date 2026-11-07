@@ -65,8 +65,10 @@ def country_of(category, name):
     return "other"
 
 
-def build(channels):
-    """channels : dicts {name, country, xtream (bool), ...} → [(titre, [chaîne de la grille avec 'streams'])]"""
+def build(channels, excluded=()):
+    """channels : dicts {name, country, xtream (bool), ...} → [(id, titre, [chaîne de la grille avec 'streams'])]
+    excluded : chaînes (« tnt/TF1 », « theme/<clé> ») et sections (« section/<id> ») retirées, communes avec l'iPhone"""
+    excluded = set(excluded)
     blocks = DEF["main"] + DEF["after_themes"]
     slots, themed, order = {}, {}, {}
     for c in channels:
@@ -78,7 +80,7 @@ def build(channels):
             for i, e in enumerate(b["channels"]):
                 if matches(k, e["keys"]):
                     slot = slots.setdefault(b["id"], {}).setdefault(i, {"name": e["name"], "logo": "", "streams": [],
-                                                                        "section": b["title"]})
+                                                                        "section": b["title"], "gid": "%s/%s" % (b["id"], e["name"])})
                     slot["streams"].append(c)
                     slot["logo"] = slot["logo"] or c.get("logo", "")
                     placed = True
@@ -92,7 +94,8 @@ def build(channels):
             if any(m == "" or m in t for m in g["match"]):
                 d = themed.setdefault(g["title"], {})
                 if k not in d:
-                    d[k] = {"name": display(c["name"]), "logo": c.get("logo", ""), "streams": [], "section": g["title"]}
+                    d[k] = {"name": display(c["name"]), "logo": c.get("logo", ""), "streams": [], "section": g["title"],
+                            "gid": "theme/" + k}
                     order.setdefault(g["title"], []).append(k)
                 d[k]["streams"].append(c)
                 break
@@ -102,16 +105,17 @@ def build(channels):
         return ch
 
     out = []
+
+    def add(sid, title, lst):
+        lst = [ordered(c) for c in lst if c["gid"] not in excluded]
+        if lst and "section/" + sid not in excluded:
+            out.append((sid, title, lst))
+
     for b in DEF["main"]:
-        lst = [ordered(slots[b["id"]][i]) for i in range(len(b["channels"])) if i in slots.get(b["id"], {})]
-        if lst:
-            out.append((b["title"], lst))
+        add(b["id"], b["title"], [slots[b["id"]][i] for i in range(len(b["channels"])) if i in slots.get(b["id"], {})])
     for g in DEF["themes"]["groups"]:
-        lst = sorted((themed[g["title"]][k] for k in order.get(g["title"], [])), key=lambda c: fold(c["name"]))
-        if lst:
-            out.append((g["title"], [ordered(c) for c in lst]))
+        add("theme/" + g["title"], g["title"],
+            sorted((themed[g["title"]][k] for k in order.get(g["title"], [])), key=lambda c: fold(c["name"])))
     for b in DEF["after_themes"]:
-        lst = [ordered(slots[b["id"]][i]) for i in range(len(b["channels"])) if i in slots.get(b["id"], {})]
-        if lst:
-            out.append((b["title"], lst))
+        add(b["id"], b["title"], [slots[b["id"]][i] for i in range(len(b["channels"])) if i in slots.get(b["id"], {})])
     return out

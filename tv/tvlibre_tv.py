@@ -80,6 +80,17 @@ class Xtream:
 
 # ---------------------------------------------------------------- reprise de lecture
 
+GRILLE = os.environ.get("TVLIBRE_TV_GRILLE", "/etc/tvlibre/grille.json")
+
+
+def excluded():
+    """Chaînes et sections retirées de la grille (choix fait sur l'iPhone, partagé avec la télé)"""
+    try:
+        return set(json.load(open(GRILLE)).get("excluded", []))
+    except Exception:
+        return set()
+
+
 class WatchStore:
     def __init__(self):
         self.path = os.path.join(DATA, "watch.json")
@@ -156,7 +167,8 @@ class Catalog(QObject):
                          "xtream": True, "id": str(st.get("stream_id")), "logo": st.get("stream_icon") or "",
                          "archive_days": int(st.get("tv_archive_duration") or 0) if str(st.get("tv_archive")) == "1" else 0})
         flat += self._load_fallback()
-        self._set_lineup(lineup.build(flat))
+        self._raw = flat
+        self._set_lineup(lineup.build(flat, excluded()))
         self.changed.emit()
         vcats = {str(c["category_id"]): c.get("category_name") for c in (self.xt.api("get_vod_categories") or [])}
         vods = self.xt.api("get_vod_streams") or []
@@ -211,7 +223,8 @@ class Catalog(QObject):
                    "France 24", "Euronews", "TCM Cinéma", "OCS Max", "MTV Hits", "Téva", "AB1", "KTO"]:
             n += 1
             fake.append({"name": nm, "country": "fr", "xtream": True, "id": "d%d" % n, "logo": "", "archive_days": 7})
-        self._set_lineup(lineup.build(fake), rnd)
+        self._raw = fake
+        self._set_lineup(lineup.build(fake, excluded()), rnd)
         words = ["Le dernier", "Nuit", "Retour", "Horizon", "Les ombres", "Rivière", "Grand nord", "L'été", "Silence",
                  "Le passage", "Cœur", "Frontière", "Lumière", "Le phare", "Vertige"]
         def film(i, k):
@@ -233,7 +246,7 @@ class Catalog(QObject):
         """Grille TV Libre → groupes et chaînes numérotées comme une télé (1, 2, 3…)"""
         self._groups, self._channels, self._flat = [], {}, []
         num = 0
-        for gi, (title, chans) in enumerate(sections):
+        for gi, (_sid, title, chans) in enumerate(sections):
             lst = []
             for c in chans:
                 num += 1
@@ -249,6 +262,11 @@ class Catalog(QObject):
             self._channels[str(gi)] = lst
             self._groups.append({"id": str(gi), "name": title, "count": len(lst)})
         self.changed.emit()
+
+    def reapply(self):
+        """Chaînes retirées depuis l'iPhone : grille refaite sans recharger le serveur"""
+        if getattr(self, "_raw", None) is not None:
+            self._set_lineup(lineup.build(self._raw, excluded()))
 
     # -- accès depuis l'interface --
     @Property(bool, notify=changed)
@@ -623,6 +641,7 @@ def register_video_item():
 
 class Remote(QObject):
     key = Signal(str)
+    reload = Signal()
     playRequest = Signal("QVariantMap")
     stopRequest = Signal()
 
@@ -655,6 +674,9 @@ def serve_remote(remote, player, port=8091):
                 it = player._item or {}
                 return self.reply(200, {"playing": player._playing, "name": it.get("name"), "kind": it.get("kind"),
                                         "since": getattr(player, "since", 0)})
+            if u.path == "/reload":
+                remote.reload.emit()
+                return self.reply(200, {"ok": True})
             if u.path == "/stop":
                 remote.stopRequest.emit()
                 return self.reply(200, {"ok": True})
@@ -696,6 +718,7 @@ def main():
     catalog = Catalog(xt, demo=args.demo, fallback=cfg.get("fallback", []) if not args.demo else ())
     player = Player(xt, demo=args.demo)
     remote = Remote()
+    remote.reload.connect(catalog.reapply)
     if not args.shot:
         serve_remote(remote, player)
 
