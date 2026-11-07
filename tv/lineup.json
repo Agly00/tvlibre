@@ -19,7 +19,7 @@
         {"name": "Gulli", "keys": ["gulli"]},
         {"name": "BFM TV", "keys": ["bfmtv", "bfm"]},
         {"name": "CNews", "keys": ["cnews"]},
-        {"name": "LCI", "keys": ["lci"]},
+        {"name": "LCI", "keys": ["lci", "lachaineinfo", "lcilachaineinfo"]},
         {"name": "Franceinfo", "keys": ["franceinfo", "franceinfotv", "franceinfo27"]},
         {"name": "CStar", "keys": ["cstar"]},
         {"name": "T18", "keys": ["t18"]},
