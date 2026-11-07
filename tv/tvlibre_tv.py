@@ -83,12 +83,23 @@ class Xtream:
 GRILLE = os.environ.get("TVLIBRE_TV_GRILLE", "/etc/tvlibre/grille.json")
 
 
-def excluded():
-    """Chaînes et sections retirées de la grille (choix fait sur l'iPhone, partagé avec la télé)"""
+def grille():
+    """Choix faits sur l'iPhone, partagés avec la télé : chaînes et sections retirées, chaînes rangées ailleurs,
+    chaînes servant de secours à d'autres"""
     try:
-        return set(json.load(open(GRILLE)).get("excluded", []))
+        d = json.load(open(GRILLE))
     except Exception:
-        return set()
+        d = {}
+    return {"excluded": set(d.get("excluded", [])), "moved": d.get("moved") or {}, "merged": d.get("merged") or {}}
+
+
+def excluded():
+    return grille()["excluded"]
+
+
+def build_lineup(flat):
+    g = grille()
+    return lineup.build(flat, g["excluded"], g["moved"], g["merged"])
 
 
 class WatchStore:
@@ -163,12 +174,15 @@ class Catalog(QObject):
         flat = []
         for st in streams:
             name = st.get("name") or ""
-            flat.append({"name": name, "country": lineup.country_of(cats.get(str(st.get("category_id")), ""), name),
+            if lineup.shifted(name):
+                continue                              # chaîne décalée (-2H, +1…) : le replay la remplace
+            cat = cats.get(str(st.get("category_id")), "")
+            flat.append({"name": name, "group": cat, "country": lineup.country_of(cat, name),
                          "xtream": True, "id": str(st.get("stream_id")), "logo": st.get("stream_icon") or "",
                          "archive_days": int(st.get("tv_archive_duration") or 0) if str(st.get("tv_archive")) == "1" else 0})
         flat += self._load_fallback()
         self._raw = flat
-        self._set_lineup(lineup.build(flat, excluded()))
+        self._set_lineup(build_lineup(flat))
         self.changed.emit()
         vcats = {str(c["category_id"]): c.get("category_name") for c in (self.xt.api("get_vod_categories") or [])}
         vods = self.xt.api("get_vod_streams") or []
@@ -205,7 +219,11 @@ class Catalog(QObject):
                 elif line and not line.startswith("#") and info:
                     attrs = dict(re.findall(r'([A-Za-z0-9\-]+)="([^"]*)"', info))
                     name = info.rsplit(",", 1)[-1].strip()
-                    out.append({"name": name, "country": lineup.country_of(attrs.get("group-title", ""), name),
+                    if lineup.shifted(name):
+                        info = None
+                        continue
+                    out.append({"name": name, "group": attrs.get("group-title", ""),
+                                "country": lineup.country_of(attrs.get("group-title", ""), name),
                                 "xtream": False, "url": line, "logo": attrs.get("tvg-logo", "")})
                     info = None
         return out
@@ -224,7 +242,7 @@ class Catalog(QObject):
             n += 1
             fake.append({"name": nm, "country": "fr", "xtream": True, "id": "d%d" % n, "logo": "", "archive_days": 7})
         self._raw = fake
-        self._set_lineup(lineup.build(fake, excluded()), rnd)
+        self._set_lineup(build_lineup(fake), rnd)
         words = ["Le dernier", "Nuit", "Retour", "Horizon", "Les ombres", "Rivière", "Grand nord", "L'été", "Silence",
                  "Le passage", "Cœur", "Frontière", "Lumière", "Le phare", "Vertige"]
         def film(i, k):
@@ -266,7 +284,7 @@ class Catalog(QObject):
     def reapply(self):
         """Chaînes retirées depuis l'iPhone : grille refaite sans recharger le serveur"""
         if getattr(self, "_raw", None) is not None:
-            self._set_lineup(lineup.build(self._raw, excluded()))
+            self._set_lineup(build_lineup(self._raw))
 
     # -- accès depuis l'interface --
     @Property(bool, notify=changed)

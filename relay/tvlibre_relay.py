@@ -22,7 +22,7 @@ import collections, json, math, os, re, shutil, socket, struct, subprocess, sys,
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -2717,9 +2717,11 @@ class Handler(BaseHTTPRequestHandler):
                 n = int(self.headers.get("Content-Length") or 0)
                 d = json.loads(self.rfile.read(min(n, 200000)) or b"{}")
                 ex = sorted({str(x)[:200] for x in (d.get("excluded") or [])})[:2000]
+                mv = {str(k)[:200]: str(v)[:200] for k, v in (d.get("moved") or {}).items()}
+                mg = {str(k)[:200]: str(v)[:200] for k, v in (d.get("merged") or {}).items()}
                 os.makedirs("/etc/tvlibre", exist_ok=True)
                 with open("/etc/tvlibre/grille.json.tmp", "w") as f:
-                    json.dump({"excluded": ex, "at": int(time.time())}, f)
+                    json.dump({"excluded": ex, "moved": mv, "merged": mg, "at": int(time.time())}, f)
                 os.replace("/etc/tvlibre/grille.json.tmp", "/etc/tvlibre/grille.json")
             except Exception as e:
                 return self.js({"error": str(e)[:100]}, 400)

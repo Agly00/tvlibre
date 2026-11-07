@@ -13,12 +13,13 @@ DEF = json.load(open(os.path.join(HERE, "lineup.json"), encoding="utf-8"))
 QUALITY = {"hd", "fhd", "uhd", "sd", "4k", "hevc", "h265", "h264", "raw", "backup", "vip", "low", "multi",
            "1080p", "720p", "576p", "50fps", "60fps", "hdr", "plus"}
 PREFIX = re.compile(r"^\s*[|\[(]?\s*[A-Za-z]{2,3}\s*[|\])\:\-]\s*")
-PREFIX2 = re.compile(r"^[\W_]*(FR|FRA|CH|SUI|UK|GB|US|USA|EN|BE|CA)[\W_]+", re.I)
-CODES = {"fr", "fra", "ch", "sui", "uk", "gb", "us", "usa", "en", "be", "ca"}
-SHIFTED = re.compile(r"(^|\s)[+-]\s?\d{1,2}\s?(h|hr|hrs)?\s*$", re.I)
+PREFIX2 = re.compile(r"^[\W_]*(FR|FRA|CH|SUI|UK|GB|US|USA|EN|BE|CA|RE)[\W_]+", re.I)
+CODES = {"fr", "fra", "ch", "sui", "uk", "gb", "us", "usa", "en", "be", "ca", "re"}
+SHIFTED = re.compile(r"(^|[\s(\[|_])(h\s?)?[+\-−–]\s?\d{1,2}\s?(h|hr|hrs|heures?)?(?=$|[\s)\]|_])", re.I)
 
 
 def fold(s):
+    s = unicodedata.normalize("NFKC", s)          # ᴴᴰ, ᶠᴴᴰ, 𝐓𝐅𝟏… ramenés aux lettres ordinaires
     return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").lower()
 
 
@@ -34,7 +35,7 @@ def clean(raw):
 
 def shifted(raw):
     """Chaîne décalée (« TF1 -2 », « M6 +1 ») : doublon du direct, le replay fait mieux"""
-    return bool(SHIFTED.search(clean(raw)))
+    return bool(SHIFTED.search(unicodedata.normalize("NFKC", raw)))
 
 
 def key(raw):
@@ -79,7 +80,14 @@ def country_of(category, name):
     return "other"
 
 
-def build(channels, excluded=()):
+def is_reunion(c):
+    """Réunion (catégorie ou nom) : seulement en secours des chaînes gardées"""
+    t = fold(c.get("group", "") + " " + c["name"])
+    g = fold(c.get("group", ""))
+    return "reunion" in t or re.search(r"(^|[^0-9])974([^0-9]|$)", t) is not None or re.match(r"^[^a-z0-9]*re([^a-z0-9]|$)", g) is not None
+
+
+def build(channels, excluded=(), moved=None, merged=None):
     """channels : dicts {name, country, xtream (bool), ...} → [(id, titre, [chaîne de la grille avec 'streams'])]
     excluded : chaînes (« tnt/TF1 », « theme/<clé> ») et sections (« section/<id> ») retirées, communes avec l'iPhone"""
     excluded = set(excluded)
@@ -103,7 +111,7 @@ def build(channels, excluded=()):
                     break
             if placed:
                 break
-        if placed or cc not in DEF["themes"]["countries"] or not c.get("xtream"):
+        if placed or cc not in DEF["themes"]["countries"] or not c.get("xtream") or is_reunion(c):
             continue
         t = text(c["name"])
         for g in DEF["themes"]["groups"]:
@@ -134,4 +142,35 @@ def build(channels, excluded=()):
             sorted((themed[g["title"]][k] for k in order.get(g["title"], [])), key=lambda c: fold(c["name"])))
     for b in DEF["after_themes"]:
         add(b["id"], b["title"], [slots[b["id"]][i] for i in range(len(b["channels"])) if i in slots.get(b["id"], {})])
-    return out
+    return overrides(out, moved or {}, merged or {})
+
+
+def overrides(secs, moved, merged):
+    """Choix faits sur l'iPhone : chaîne en secours d'une autre, ou rangée dans une autre section"""
+    secs = [[sid, title, list(lst)] for sid, title, lst in secs]
+
+    def find(k):
+        for si, s in enumerate(secs):
+            for ci, c in enumerate(s[2]):
+                if c["gid"] == k:
+                    return si, ci
+        return None
+    for src, dst in merged.items():
+        a, b = find(src), find(dst)
+        if a and b and src != dst:
+            c = secs[a[0]][2][a[1]]
+            secs[b[0]][2][b[1]]["streams"] += c["streams"]
+            del secs[a[0]][2][a[1]]
+    titles = {b["id"]: b["title"] for b in DEF["main"] + DEF["after_themes"]}
+    titles.update({"theme/" + g["title"]: g["title"] for g in DEF["themes"]["groups"]})
+    for k, target in moved.items():
+        a = find(k)
+        if not a:
+            continue
+        ti = next((i for i, s in enumerate(secs) if s[0] == target), None)
+        if ti is None and target in titles:
+            secs.append([target, titles[target], []])
+            ti = len(secs) - 1
+        if ti is not None and ti != a[0]:
+            secs[ti][2].append(secs[a[0]][2].pop(a[1]))
+    return [(sid, title, lst) for sid, title, lst in secs if lst]
