@@ -11,8 +11,10 @@ import unicodedata
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEF = json.load(open(os.path.join(HERE, "lineup.json"), encoding="utf-8"))
 QUALITY = {"hd", "fhd", "uhd", "sd", "4k", "hevc", "h265", "h264", "raw", "backup", "vip", "low", "multi",
-           "1080p", "720p", "576p", "50fps", "60fps", "hdr", "plus"}
-PREFIX = re.compile(r"^\s*[|\[(]?\s*[A-Za-z]{2,3}\s*[|\])\:\-]\s*")
+           "1080p", "720p", "576p", "50fps", "60fps", "hdr", "plus", "full", "ʜᴅ"}
+PREFIX = re.compile(r"^\s*[|\[(]?\s*(FR|FRA|CH|SUI|UK|GB|US|USA|EN|BE|CA|RE|AR|DE|IT|ES)\s*[|\])\:\-]\s*", re.I)
+REU = re.compile(r"^\s*(C\+\s*)?R[ÉE]U(NION)?\s*[|:\-]\s*", re.I)
+GLUED = re.compile(r"(?<=[A-Za-z])\+\d{1,2}(?=$|[\s)\]|_])")
 PREFIX2 = re.compile(r"^[\W_]*(FR|FRA|CH|SUI|UK|GB|US|USA|EN|BE|CA|RE)[\W_]+", re.I)
 CODES = {"fr", "fra", "ch", "sui", "uk", "gb", "us", "usa", "en", "be", "ca", "re"}
 SHIFTED = re.compile(r"(^|[\s(\[|_])(h\s?)?[+\-−–]\s?\d{1,2}\s?(h|hr|hrs|heures?)?(?=$|[\s)\]|_])", re.I)
@@ -35,11 +37,18 @@ def clean(raw):
 
 def shifted(raw):
     """Chaîne décalée (« TF1 -2 », « M6 +1 ») : doublon du direct, le replay fait mieux"""
-    return bool(SHIFTED.search(unicodedata.normalize("NFKC", raw)))
+    s = unicodedata.normalize("NFKC", raw)
+    return bool(SHIFTED.search(s) or GLUED.search(s))
+
+
+def strip_reunion(s):
+    """« C+ RÉU| TF1 HD » → « TF1 HD » : la version Réunion vient en secours de la chaîne"""
+    m = REU.match(s)
+    return s[m.end():] if m and s[m.end():].strip() else s
 
 
 def key(raw):
-    tokens = [t for t in re.split(r"[^0-9a-z+]+", fold(clean(raw))) if t]
+    tokens = [t for t in re.split(r"[^0-9a-z+ʜᴅ]+", fold(clean(strip_reunion(unicodedata.normalize("NFKC", raw))))) if t]
     if len(tokens) > 1 and tokens[0] in CODES:
         tokens.pop(0)
     while len(tokens) > 1 and (tokens[-1] in QUALITY or tokens[-1] in CODES):
@@ -93,7 +102,8 @@ def build(channels, excluded=(), moved=None, merged=None):
     excluded = set(excluded)
     blocks = DEF["main"] + DEF["after_themes"]
     slots, themed, order = {}, {}, {}
-    for c in channels:
+    # versions Réunion en dernier : seulement en secours, après les flux de métropole
+    for c in [c for c in channels if not is_reunion(c)] + [c for c in channels if is_reunion(c)]:
         if shifted(c["name"]):
             continue
         k, cc = key(c["name"]), c.get("country", "other")

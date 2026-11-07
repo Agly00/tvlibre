@@ -5,16 +5,16 @@
     {
       "id": "tnt", "title": "TNT", "countries": ["fr", "ch", "other"],
       "channels": [
-        {"name": "TF1", "keys": ["tf1"]},
+        {"name": "TF1", "keys": ["tf1", "tf11"]},
         {"name": "France 2", "keys": ["france2"]},
         {"name": "France 3", "keys": ["france3", "france3national"]},
         {"name": "France 4", "keys": ["france4"]},
         {"name": "France 5", "keys": ["france5"]},
         {"name": "M6", "keys": ["m6"]},
         {"name": "Arte", "keys": ["arte", "artefrance", "artefr", "artefrancais"]},
-        {"name": "LCP / Public Sénat", "keys": ["lcp", "lcpan", "lcpassembleenationale", "publicsenat", "lcppublicsenat", "lcpps"]},
+        {"name": "LCP / Public Sénat", "keys": ["lcp", "lcpan", "lcpassembleenationale", "publicsenat", "lcppublicsenat", "lcpps", "assembleenationale", "lcpassembleenationale"]},
         {"name": "W9", "keys": ["w9"]},
-        {"name": "TMC", "keys": ["tmc"]},
+        {"name": "TMC", "keys": ["tmc", "tmc1"]},
         {"name": "TFX", "keys": ["tfx"]},
         {"name": "Gulli", "keys": ["gulli"]},
         {"name": "BFM TV", "keys": ["bfmtv", "bfm"]},
@@ -24,7 +24,7 @@
         {"name": "CStar", "keys": ["cstar"]},
         {"name": "T18", "keys": ["t18"]},
         {"name": "NOVO19", "keys": ["novo19", "novo"]},
-        {"name": "TF1 Séries Films", "keys": ["tf1seriesfilms", "tf1sf"]},
+        {"name": "TF1 Séries Films", "keys": ["tf1seriesfilms", "tf1sf", "tf1series", "tf1sieres"]},
         {"name": "L'Équipe", "keys": ["lequipe", "lequipetv", "lequipe21", "equipe21"]},
         {"name": "6ter", "keys": ["6ter"]},
         {"name": "RMC Story", "keys": ["rmcstory"]},
@@ -60,11 +60,11 @@
         {"name": "One TV", "keys": ["onetv", "one"]},
         {"name": "TVM3", "keys": ["tvm3"]},
         {"name": "Blue Sport", "keys": ["bluesport*", "bluezoom"]},
-        {"name": "MySports", "keys": ["mysports*"]},
+        {"name": "MySports", "keys": ["mysports", "mysports1", "mysportsun"]},
         {"name": "Léman Bleu", "keys": ["lemanbleu"]},
         {"name": "La Télé", "keys": ["latele", "latelevaudfribourg"]},
         {"name": "Canal 9", "keys": ["canal9"]},
-        {"name": "Canal Alpha", "keys": ["canalalpha"]},
+        {"name": "Canal Alpha", "keys": ["canalalpha*"]},
         {"name": "TeleBielingue", "keys": ["telebielingue"]},
         {"name": "Carac TV", "keys": ["caractv", "carac", "carac1"]}
       ]
@@ -76,7 +76,7 @@
         {"name": "BBC Two", "keys": ["bbctwo", "bbc2"]},
         {"name": "ITV1", "keys": ["itv1", "itv", "itvlondon"]},
         {"name": "Channel 4", "keys": ["channel4", "c4"]},
-        {"name": "Channel 5", "keys": ["channel5", "five", "5"]},
+        {"name": "Channel 5", "keys": ["channel5", "five"]},
         {"name": "BBC News", "keys": ["bbcnews", "bbcworldnews"]},
         {"name": "Sky News", "keys": ["skynews"]}
       ]
