@@ -36,13 +36,21 @@ Window {
     property int epgTick: 0
 
     readonly property int gridCols: 4
-    readonly property var pages: ["Direct", "Films", "Séries", "Enregistrés"]
+    readonly property var pages: ["Direct", "Films", "Séries", "Enregistrés", "Programme TV"]
+    // Programme TV : ligne (chaîne), curseur (heure visée), début de la fenêtre affichée
+    property int guideRow: 0
+    property real guideCursor: Date.now() / 1000
+    property real guideT0: Math.floor(Date.now() / 1800000) * 1800 - 1800
+    readonly property real guideSpan: 3 * 3600
+    property int guideTick: 0
+    property string toast: ""
     readonly property var rows: page === 1 ? catalog.movieRows : page === 2 ? catalog.seriesRows : []
 
     Connections {
         target: catalog
         function onChanged() { groupChannels = catalog.channels(groupIndex) }
         function onEpgReady(sid) { epgTick++ }
+        function onGuideReady(sid) { guideTick++ }
     }
     Connections { target: remote; function onKey(k) { handle(k) } }
 
@@ -115,7 +123,7 @@ Window {
         if (area === "rail") {
             if (k === "up") page = Math.max(0, page - 1)
             else if (k === "down") page = Math.min(pages.length - 1, page + 1)
-            else if (k === "right" || k === "ok") area = page === 0 ? "groups" : (rows.length ? "rows" : "rail")
+            else if (k === "right" || k === "ok") area = page === 0 ? "groups" : page === 4 ? "guide" : (rows.length ? "rows" : "rail")
             else if (k === "back" && player.playing) mode = player.item.kind === "live" ? "live" : "vod"
             return
         }
@@ -137,6 +145,7 @@ Window {
             else if (k === "back") area = "groups"
             return
         }
+        if (area === "guide") return guideKey(k)
         if (area === "rows") {
             var r = rows[rowIndex]
             if (!r) { area = "rail"; return }
@@ -152,6 +161,50 @@ Window {
             else if (k === "back") area = "rail"
         }
     }
+
+    function guideList(i) { guideTick; var c = catalog.allChannels[i]; return c ? catalog.guide(c.id) : [] }
+    function guideProg(i, t) {
+        var l = guideList(i)
+        for (var j = 0; j < l.length; j++) if (l[j].start <= t && l[j].stop > t) return { p: l[j], j: j }
+        return null
+    }
+    function keepVisible() {
+        if (guideCursor < guideT0) guideT0 = Math.floor(guideCursor / 1800) * 1800
+        if (guideCursor > guideT0 + guideSpan - 600) guideT0 = Math.floor(guideCursor / 1800) * 1800 - guideSpan + 3600
+    }
+    function guideKey(k) {
+        var n = catalog.allChannels.length
+        if (k === "up") { if (guideRow > 0) guideRow--; else area = "rail" }
+        else if (k === "down") guideRow = Math.min(n - 1, guideRow + 1)
+        else if (k === "left" || k === "right") {
+            var cur = guideProg(guideRow, guideCursor)
+            var l = guideList(guideRow)
+            if (k === "left") {
+                if (cur && cur.j > 0) guideCursor = (l[cur.j - 1].start + l[cur.j - 1].stop) / 2
+                else if (guideCursor - 1800 < Date.now() / 1000 - 7 * 86400) area = "rail"
+                else guideCursor -= 1800
+            } else {
+                if (cur && cur.j + 1 < l.length) guideCursor = (l[cur.j + 1].start + l[cur.j + 1].stop) / 2
+                else guideCursor += 1800
+            }
+            keepVisible()
+        }
+        else if (k === "ok") {
+            var ch = catalog.allChannels[guideRow], hit = guideProg(guideRow, guideCursor), now = Date.now() / 1000
+            if (!ch) return
+            if (!hit || (hit.p.start <= now && hit.p.stop > now)) { playLive(catalog.allChannels, guideRow) }
+            else if (hit.p.archive) { player.playReplay(ch, hit.p.start, hit.p.stop, hit.p.title); mode = "vod"; showBanner() }
+            else if (hit.p.start > now) { showToast(catalog.record(ch.id, hit.p.start, hit.p.stop, hit.p.title) + " : " + hit.p.title) }
+        }
+        else if (k === "play") {
+            var c2 = catalog.allChannels[guideRow], h2 = guideProg(guideRow, guideCursor)
+            if (c2 && h2) showToast(catalog.record(c2.id, h2.p.start, h2.p.stop, h2.p.title) + " : " + h2.p.title)
+        }
+        else if (k === "back") area = "rail"
+    }
+    function showToast(t) { toast = t; toastTimer.restart() }
+    Timer { id: toastTimer; interval: 3500; onTriggered: toast = "" }
+    function hm(ts) { var d = new Date(ts * 1000); return (d.getHours() < 10 ? "0" : "") + d.getHours() + ":" + (d.getMinutes() < 10 ? "0" : "") + d.getMinutes() }
 
     function showBanner() { bannerVisible = true; bannerTimer.restart() }
     Timer { id: bannerTimer; interval: 5000; onTriggered: bannerVisible = false }
@@ -371,6 +424,84 @@ Window {
                     }
                 }
 
+                // -------- Programme TV : chaînes en lignes, heures en colonnes
+                Item {
+                    id: guidePage
+                    anchors.fill: parent
+                    visible: page === 4 && !catalog.loading
+                    readonly property real nameW: 250
+                    readonly property real lineW: width - nameW
+                    readonly property real pps: lineW / guideSpan
+                    Row {
+                        x: guidePage.nameW; height: 40
+                        Repeater {
+                            model: 6
+                            Text {
+                                width: guidePage.lineW / 6
+                                text: hm(guideT0 + index * 1800); color: dim; font.pixelSize: 22
+                            }
+                        }
+                    }
+                    Text {
+                        x: 0; y: 4; text: new Date(guideCursor * 1000).toLocaleDateString(Qt.locale("fr_FR"), "dddd d MMMM")
+                        color: fg; font.pixelSize: 22; font.weight: Font.DemiBold
+                    }
+                    ListView {
+                        id: guideView
+                        y: 50; width: parent.width; height: parent.height - 110
+                        model: catalog.allChannels
+                        currentIndex: guideRow
+                        clip: true; spacing: 6
+                        highlightMoveDuration: 150
+                        preferredHighlightBegin: 120; preferredHighlightEnd: height - 220
+                        highlightRangeMode: ListView.ApplyRange
+                        delegate: Item {
+                            id: grow
+                            width: guideView.width; height: 92
+                            property int ri: index
+                            property var progs: { guideTick; return catalog.guide(modelData.id) }
+                            Rectangle {
+                                width: guidePage.nameW - 14; height: parent.height; radius: 12
+                                color: ri === guideRow && area === "guide" ? "#2c2c33" : panel
+                                Text { x: 18; anchors.verticalCenter: parent.verticalCenter; width: parent.width - 30; elide: Text.ElideRight
+                                       text: modelData.num + "  " + modelData.name; color: fg; font.pixelSize: 24; font.weight: Font.DemiBold }
+                            }
+                            Item {
+                                x: guidePage.nameW; width: guidePage.lineW; height: parent.height; clip: true
+                                Repeater {
+                                    model: grow.progs
+                                    Rectangle {
+                                        visible: modelData.stop > guideT0 && modelData.start < guideT0 + guideSpan
+                                        property bool isNow: modelData.start <= Date.now() / 1000 && modelData.stop > Date.now() / 1000
+                                        property bool sel: ri === guideRow && area === "guide" && modelData.start <= guideCursor && modelData.stop > guideCursor
+                                        x: Math.max(0, (modelData.start - guideT0) * guidePage.pps)
+                                        width: Math.max(4, Math.min(guidePage.lineW, (modelData.stop - guideT0) * guidePage.pps) - x - 6)
+                                        height: parent.height; radius: 12
+                                        color: sel ? "#ffffff" : isNow ? "#4a2a2a" : (modelData.stop < Date.now() / 1000 ? "#17171b" : panel)
+                                        Column {
+                                            x: 14; y: 12; width: parent.width - 24
+                                            Text { width: parent.width; elide: Text.ElideRight; font.pixelSize: 23; font.weight: Font.DemiBold
+                                                   text: (modelData.archive ? "↺ " : "") + modelData.title; color: parent.parent.sel ? "#111" : fg }
+                                            Text { width: parent.width; elide: Text.ElideRight; font.pixelSize: 19
+                                                   text: hm(modelData.start) + " – " + hm(modelData.stop); color: parent.parent.sel ? "#444" : dim }
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    property real nx: (Date.now() / 1000 - guideT0) * guidePage.pps
+                                    visible: nx > 0 && nx < guidePage.lineW
+                                    x: nx; width: 3; height: parent.height; color: accent
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        anchors.bottom: parent.bottom; anchors.bottomMargin: 10; anchors.right: parent.right
+                        text: "◀▶ émission   OK regarder / revoir / enregistrer   ▶❙❙ enregistrer"
+                        color: dim; font.pixelSize: 20
+                    }
+                }
+
                 Text {
                     visible: page === 3
                     text: "Enregistrements et films mis de côté sur la clé du Raspberry\n(à brancher sur le relais : liste /rec/list)"
@@ -464,10 +595,18 @@ Window {
         }
     }
 
+    Rectangle {
+        visible: toast !== ""
+        anchors.top: parent.top; anchors.topMargin: 40; anchors.horizontalCenter: parent.horizontalCenter
+        width: toastText.implicitWidth + 60; height: 70; radius: 35; color: "#ee1c1c22"
+        Text { id: toastText; anchors.centerIn: parent; text: toast; color: "white"; font.pixelSize: 26 }
+    }
+
     Component.onCompleted: {
         if (startPage === "films") { page = 1; area = "rows" }
         else if (startPage === "series") { page = 2; area = "rows" }
         else if (startPage === "lecture") { gridDemo.start() }
+        else if (startPage === "programme") { page = 4; area = "guide" }
         else { page = 0; area = "grid" }
     }
     Timer {

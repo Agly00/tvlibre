@@ -6,7 +6,7 @@ DIR=/opt/tvlibre-tv
 apt-get update
 apt-get install -y libmpv2 python3-venv python3-pip v4l-utils cec-utils fonts-inter || apt-get install -y libmpv2 python3-venv v4l-utils cec-utils
 mkdir -p $DIR /etc/tvlibre
-cp -r tvlibre_tv.py qml $DIR/
+cp -r tvlibre_tv.py lineup.py lineup.json qml $DIR/
 python3 -m venv $DIR/venv
 $DIR/venv/bin/pip install --upgrade pip
 $DIR/venv/bin/pip install PySide6 python-mpv

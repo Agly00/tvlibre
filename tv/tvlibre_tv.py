@@ -25,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from PySide6.QtCore import QObject, Property, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QGuiApplication
 
+import lineup
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.environ.get("TVLIBRE_TV_CONFIG", "/etc/tvlibre/tv.json")
 DATA = os.path.expanduser(os.environ.get("TVLIBRE_TV_DATA", "~/.local/share/tvlibre-tv"))
@@ -60,6 +62,20 @@ class Xtream:
 
     def episode_url(self, sid, ext):
         return "%s/series/%s/%s/%s.%s" % (self.server, self.user, self.password, sid, ext or "mp4")
+
+    tz = None          # fuseau du serveur : les adresses de replay sont exprimées dans son heure
+
+    def timeshift_url(self, sid, start, stop):
+        """Replay d'une émission (heure du serveur), 5 min de marge"""
+        try:
+            from zoneinfo import ZoneInfo
+            import datetime
+            t = datetime.datetime.fromtimestamp(start, ZoneInfo(self.tz)) if self.tz else datetime.datetime.fromtimestamp(start)
+        except Exception:
+            import datetime
+            t = datetime.datetime.fromtimestamp(start)
+        minutes = int((stop - start) / 60) + 5
+        return "%s/timeshift/%s/%s/%d/%s/%s.ts" % (self.server, self.user, self.password, minutes, t.strftime("%Y-%m-%d:%H-%M"), sid)
 
 
 # ---------------------------------------------------------------- reprise de lecture
@@ -103,9 +119,12 @@ class Catalog(QObject):
     def __init__(self, xt, demo=False):
         super().__init__()
         self.xt, self.demo = xt, demo
-        self._groups, self._channels = [], {}
+        self._groups, self._channels, self._flat = [], {}, []
         self._movie_rows, self._series_rows = [], []
         self._epg = {}
+        self._guides = {}
+        from concurrent.futures import ThreadPoolExecutor
+        self._pool = ThreadPoolExecutor(max_workers=4)
         self._loading = True
         threading.Thread(target=self._load, daemon=True).start()
 
@@ -123,16 +142,19 @@ class Catalog(QObject):
         self.epgReady.emit("*")
 
     def _load_xtream(self):
-        cats = self.xt.api("get_live_categories") or []
+        try:
+            self.xt.tz = ((self.xt.api() or {}).get("server_info") or {}).get("timezone")
+        except Exception:
+            pass
+        cats = {str(c["category_id"]): c.get("category_name") or "" for c in (self.xt.api("get_live_categories") or [])}
         streams = self.xt.api("get_live_streams") or []
-        by = {}
-        for s in streams:
-            by.setdefault(str(s.get("category_id")), []).append({
-                "id": str(s.get("stream_id")), "name": s.get("name") or "", "logo": s.get("stream_icon") or "",
-                "num": s.get("num") or 0, "kind": "live"})
-        self._groups = [{"id": str(c["category_id"]), "name": c.get("category_name") or "", "count": len(by.get(str(c["category_id"]), []))}
-                        for c in cats if by.get(str(c["category_id"]))]
-        self._channels = by
+        flat = []
+        for st in streams:
+            name = st.get("name") or ""
+            flat.append({"name": name, "country": lineup.country_of(cats.get(str(st.get("category_id")), ""), name),
+                         "xtream": True, "id": str(st.get("stream_id")), "logo": st.get("stream_icon") or "",
+                         "archive_days": int(st.get("tv_archive_duration") or 0) if str(st.get("tv_archive")) == "1" else 0})
+        self._set_lineup(lineup.build(flat))
         self.changed.emit()
         vcats = {str(c["category_id"]): c.get("category_name") for c in (self.xt.api("get_vod_categories") or [])}
         vods = self.xt.api("get_vod_streams") or []
@@ -154,16 +176,18 @@ class Catalog(QObject):
 
     def _load_demo(self):
         rnd = random.Random(4)
-        groups = ["Généralistes", "Info", "Sport", "Cinéma", "Jeunesse", "Suisse romande", "Documentaires"]
-        n = 1
-        for gi, g in enumerate(groups):
-            chans = []
-            for i in range(rnd.randint(7, 14)):
-                chans.append({"id": "d%d" % n, "name": "%s %d" % (g.split()[0], i + 1), "logo": "", "num": n, "kind": "live",
-                              "hue": rnd.random()})
+        fake = []
+        n = 0
+        for b in lineup.DEF["main"] + lineup.DEF["after_themes"]:
+            cc = {"suisse": "ch", "uk": "uk", "us": "us"}.get(b["id"], "fr")
+            for e in b["channels"]:
                 n += 1
-            self._channels[str(gi)] = chans
-            self._groups.append({"id": str(gi), "name": g, "count": len(chans)})
+                fake.append({"name": e["name"], "country": cc, "xtream": True, "id": "d%d" % n, "logo": "", "archive_days": 7})
+        for nm in ["Canal+ Sport", "beIN Sports 1", "Eurosport 1", "Planète+", "Ushuaïa TV", "Disney Channel", "Piwi+",
+                   "France 24", "Euronews", "TCM Cinéma", "OCS Max", "MTV Hits", "Téva", "AB1", "KTO"]:
+            n += 1
+            fake.append({"name": nm, "country": "fr", "xtream": True, "id": "d%d" % n, "logo": "", "archive_days": 7})
+        self._set_lineup(lineup.build(fake), rnd)
         words = ["Le dernier", "Nuit", "Retour", "Horizon", "Les ombres", "Rivière", "Grand nord", "L'été", "Silence",
                  "Le passage", "Cœur", "Frontière", "Lumière", "Le phare", "Vertige"]
         def film(i, k):
@@ -180,6 +204,26 @@ class Catalog(QObject):
                 self._epg[c["id"]] = {"now": rnd.choice(["Journal", "Magazine", "Film : " + rnd.choice(words), "Série", "Match en direct", "Documentaire"]),
                                       "next": rnd.choice(["Météo", "Jeu", "Talk-show", "Film", "Reportage"]),
                                       "start": "20:30", "end": "22:10", "progress": rnd.random()}
+
+    def _set_lineup(self, sections, rnd=None):
+        """Grille TV Libre → groupes et chaînes numérotées comme une télé (1, 2, 3…)"""
+        self._groups, self._channels, self._flat = [], {}, []
+        num = 0
+        for gi, (title, chans) in enumerate(sections):
+            lst = []
+            for c in chans:
+                num += 1
+                st = [{"id": x["id"], "archive_days": x.get("archive_days", 0)} for x in c["streams"] if x.get("id")]
+                if not st:
+                    continue
+                ch = {"id": st[0]["id"], "streams": st, "name": c["name"], "logo": c.get("logo", ""), "num": num,
+                      "kind": "live", "group": title, "archive": max(x["archive_days"] for x in st),
+                      "hue": rnd.random() if rnd else 0.6}
+                lst.append(ch)
+                self._flat.append(ch)
+            self._channels[str(gi)] = lst
+            self._groups.append({"id": str(gi), "name": title, "count": len(lst)})
+        self.changed.emit()
 
     # -- accès depuis l'interface --
     @Property(bool, notify=changed)
@@ -236,6 +280,82 @@ class Catalog(QObject):
         except Exception:
             pass
 
+    @Property("QVariantList", notify=changed)
+    def allChannels(self):
+        return self._flat
+
+    guideReady = Signal(str)
+
+    @Slot(str, result="QVariantList")
+    def guide(self, sid):
+        """Programmes d'une chaîne (passés et à venir), demandés au serveur la première fois"""
+        g = self._guides.get(sid)
+        if g is not None:
+            return g
+        self._guides[sid] = []
+        if self.demo:
+            self._guides[sid] = self._fake_guide(sid)
+            return self._guides[sid]
+        self._pool.submit(self._load_guide, sid)
+        return []
+
+    def _load_guide(self, sid):
+        import base64
+        try:
+            d = self.xt.api("get_simple_data_table", stream_id=sid) or {}
+            now = time.time()
+            ch = next((c for c in self._flat if c["id"] == sid), {})
+            days = ch.get("archive", 0)
+            out = []
+            for e in d.get("epg_listings", []) if isinstance(d, dict) else []:
+                try:
+                    a, b = int(e["start_timestamp"]), int(e["stop_timestamp"])
+                except Exception:
+                    continue
+                def dec(v):
+                    try:
+                        return base64.b64decode(v or "").decode("utf-8", "replace")
+                    except Exception:
+                        return v or ""
+                arch = days > 0 and b < now and a > now - days * 86400 and str(e.get("has_archive", "1")) != "0"
+                out.append({"start": a, "stop": b, "title": dec(e.get("title")), "desc": dec(e.get("description")), "archive": arch})
+            out.sort(key=lambda x: x["start"])
+            self._guides[sid] = out
+            self.guideReady.emit(sid)
+        except Exception:
+            pass
+
+    def _fake_guide(self, sid):
+        rnd = random.Random(sid)
+        t = (int(time.time()) // 1800) * 1800 - 6 * 3600
+        out = []
+        titles = ["Journal", "Magazine", "Film", "Série", "Match en direct", "Documentaire", "Jeu", "Météo", "Talk-show", "Reportage"]
+        while t < time.time() + 12 * 3600:
+            d = rnd.choice([1800, 1800, 3600, 5400, 2700])
+            out.append({"start": t, "stop": t + d, "title": rnd.choice(titles), "desc": "", "archive": t + d < time.time()})
+            t += d
+        return out
+
+    @Slot(str, float, float, str, result=str)
+    def record(self, sid, start, stop, title):
+        """Enregistrement par le relais (clé USB) : à venir = à l'heure de diffusion, passé = depuis le replay"""
+        if self.demo or not self.xt:
+            return "démonstration"
+        ch = next((c for c in self._flat if c["id"] == sid), {})
+        try:
+            if stop > time.time():
+                q = {"u": self.xt.live_url(sid), "title": title, "channel": ch.get("name", ""), "start": int(start), "stop": int(stop)}
+                path = "/rec/schedule"
+            else:
+                q = {"u": self.xt.timeshift_url(sid, start, stop), "title": title, "channel": ch.get("name", ""),
+                     "start": int(start), "duration": int(stop - start),
+                     "expires": int(start + ch.get("archive", 7) * 86400)}
+                path = "/rec/add"
+            d = fetch_json(RELAY + path + "?" + urllib.parse.urlencode(q), timeout=20)
+            return "Enregistrement prévu" if d.get("id") else (d.get("error") or "refusé")
+        except Exception as e:
+            return "Raspberry : %s" % str(e)[:60]
+
     @Slot(str, result="QVariantList")
     def episodes(self, series_id):
         """Épisodes d'une série, toutes saisons à la suite"""
@@ -254,6 +374,7 @@ class Catalog(QObject):
 # ---------------------------------------------------------------- lecture (mpv)
 
 class Player(QObject):
+    streamFailed = Signal()
     """Une seule lecture à la fois : le compte n'accepte qu'une connexion. Le relais est prévenu (/busy) pour que
     ses téléchargements de fond se mettent en pause pendant qu'on regarde."""
     changed = Signal()
@@ -286,6 +407,16 @@ class Player(QObject):
             @self.mpv.property_observer("pause")
             def _pause(_n, v):
                 self._paused = bool(v)
+
+            @self.mpv.event_callback("end-file")
+            def _end(ev):
+                try:
+                    reason = ev.data.reason if hasattr(ev, "data") else ev["event"]["reason"]
+                except Exception:
+                    reason = None
+                if str(reason).lower().endswith("error") or reason == 4:
+                    self.streamFailed.emit()          # (fil de mpv : relayé au fil de l'interface)
+        self.streamFailed.connect(self._next_stream)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)
         self._timer.start(1000)
@@ -315,6 +446,8 @@ class Player(QObject):
     def _url(self, it):
         if self.demo or not self.xt:
             return None
+        if it["kind"] == "replay":
+            return self.xt.timeshift_url(it["id"], it["start"], it["stop"])
         if it["kind"] == "live":
             return self.xt.live_url(it["id"])
         if it["kind"] == "movie":
@@ -339,6 +472,24 @@ class Player(QObject):
             self._pos = start
         threading.Thread(target=self._busy, daemon=True).start()
         self.changed.emit()
+
+    @Slot("QVariantMap", float, float, str)
+    def playReplay(self, ch, start, stop, title):
+        """Revoir une émission passée (replay du serveur)"""
+        it = {"kind": "replay", "id": ch["id"], "name": "%s · %s" % (title, ch.get("name", "")), "start": start, "stop": stop,
+              "logo": ch.get("logo", ""), "hue": ch.get("hue", 0.6)}
+        self.play(it)
+
+    def _next_stream(self):
+        """Flux en panne : le suivant de la même chaîne (Xtream d'abord, repli ensuite)"""
+        it = self._item or {}
+        st = it.get("streams") or []
+        tried = it.setdefault("_tried", 1)
+        if it.get("kind") == "live" and tried < len(st):
+            it["_tried"] = tried + 1
+            it["id"] = st[tried]["id"]
+            if self.mpv:
+                self.mpv.play(self.xt.live_url(it["id"]))
 
     @Slot()
     def stop(self):
@@ -528,7 +679,9 @@ def main():
         for i, k in enumerate(keys):
             QTimer.singleShot(1500 + 250 * i, lambda k=k: remote.key.emit(k))
         QTimer.singleShot(2500 + 250 * len(keys), shoot)
-    sys.exit(app.exec())
+    code = app.exec()
+    sys.stdout.flush()
+    os._exit(code)            # sans attendre les demandes au serveur encore en route
 
 
 if __name__ == "__main__":

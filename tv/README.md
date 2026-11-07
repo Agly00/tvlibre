@@ -11,6 +11,11 @@ Le Raspberry branché en HDMI devient le boîtier télé : il décode lui-même 
   - la télé en HDMI‑CEC : flèches, OK, retour ;
   - un clavier ;
   - l'iPhone, par un petit serveur de commandes (`GET http://<pi>:8091/key?k=up|down|left|right|ok|back|play|menu`).
+- **Grille** : `lineup.json`, partagé avec l'app iPhone. Ordre : TNT, autres chaînes françaises par thème, Suisse
+  romande, Royaume‑Uni, États‑Unis. Les flux viennent du serveur Xtream ; une liste Netplus ne sert que de repli.
+- **Programme TV** : chaînes en lignes, heures en colonnes. Gauche et droite passent d'une émission à l'autre,
+  en arrière (replay) comme en avant. OK lance la chaîne, le replay ou l'enregistrement ; lecture‑pause enregistre.
+- **Compte** : l'iPhone l'envoie au Raspberry (Réglages, Raspberry, « Envoyer le compte à la télé »).
 - **Direct** : haut et bas pour zapper, gauche et droite pour changer de groupe, OK pour afficher ou masquer le
   bandeau, retour pour le menu (la chaîne continue derrière).
 - **Films** : gauche recule de 10 s, droite avance de 30 s, OK met en pause. La reprise de lecture est gardée sur

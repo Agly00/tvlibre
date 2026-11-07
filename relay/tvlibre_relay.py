@@ -22,7 +22,7 @@ import collections, json, math, os, re, shutil, socket, struct, subprocess, sys,
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -2702,6 +2702,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def js(self, obj, code=200):
         self.send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+
+    def do_POST(self):
+        """Compte IPTV de la télé (Raspberry branché en HDMI), envoyé par l'iPhone à la maison"""
+        u = urllib.parse.urlparse(self.path)
+        ip = self.client_address[0]
+        if u.path != "/tv/config":
+            return self.send(404, b"introuvable")
+        if not (ip.startswith("192.168.") or ip.startswith("172.") or (ip.startswith("10.") and not ip.startswith("10.66."))):
+            return self.js({"error": "seulement depuis le réseau de la maison"}, 403)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            d = json.loads(self.rfile.read(min(n, 10000)) or b"{}")
+            cfg = {"server": str(d["server"]).rstrip("/"), "username": str(d["username"]), "password": str(d["password"])}
+        except Exception:
+            return self.js({"error": "compte incomplet"}, 400)
+        try:
+            os.makedirs("/etc/tvlibre", exist_ok=True)
+            tmp = "/etc/tvlibre/tv.json.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)     # lisible par root seulement
+            with os.fdopen(fd, "w") as f:
+                json.dump(cfg, f)
+            os.replace(tmp, "/etc/tvlibre/tv.json")
+        except OSError as e:
+            return self.js({"error": str(e)}, 500)
+        log("compte de la télé reçu de", ip)
+        subprocess.run(["systemctl", "try-restart", "tvlibre-tv.service"], capture_output=True, timeout=20)
+        return self.js({"ok": True})
 
     def do_HEAD(self):
         self.do_GET(head=True)

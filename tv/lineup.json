@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "comment": "Grille TV Libre, partagée par l'app iPhone et la télé du Raspberry. Clés : nom normalisé (minuscules, sans accents ni espaces, sans HD/FHD/4K). Un « * » final = commence par.",
+  "main": [
+    {
+      "id": "tnt", "title": "TNT", "countries": ["fr", "ch", "other"],
+      "channels": [
+        {"name": "TF1", "keys": ["tf1"]},
+        {"name": "France 2", "keys": ["france2"]},
+        {"name": "France 3", "keys": ["france3", "france3national"]},
+        {"name": "France 4", "keys": ["france4"]},
+        {"name": "France 5", "keys": ["france5"]},
+        {"name": "M6", "keys": ["m6"]},
+        {"name": "Arte", "keys": ["arte", "artefrance", "artefr", "artefrancais"]},
+        {"name": "LCP / Public Sénat", "keys": ["lcp", "lcpan", "lcpassembleenationale", "publicsenat", "lcppublicsenat", "lcpps"]},
+        {"name": "W9", "keys": ["w9"]},
+        {"name": "TMC", "keys": ["tmc"]},
+        {"name": "TFX", "keys": ["tfx"]},
+        {"name": "Gulli", "keys": ["gulli"]},
+        {"name": "BFM TV", "keys": ["bfmtv", "bfm"]},
+        {"name": "CNews", "keys": ["cnews"]},
+        {"name": "LCI", "keys": ["lci"]},
+        {"name": "Franceinfo", "keys": ["franceinfo", "franceinfotv", "franceinfo27"]},
+        {"name": "CStar", "keys": ["cstar"]},
+        {"name": "T18", "keys": ["t18"]},
+        {"name": "NOVO19", "keys": ["novo19", "novo"]},
+        {"name": "TF1 Séries Films", "keys": ["tf1seriesfilms", "tf1sf"]},
+        {"name": "L'Équipe", "keys": ["lequipe", "lequipetv", "lequipe21", "equipe21"]},
+        {"name": "6ter", "keys": ["6ter"]},
+        {"name": "RMC Story", "keys": ["rmcstory"]},
+        {"name": "RMC Découverte", "keys": ["rmcdecouverte"]},
+        {"name": "RMC Life", "keys": ["rmclife", "cherie25"]},
+        {"name": "Paris Première", "keys": ["parispremiere"]}
+      ]
+    }
+  ],
+  "themes": {
+    "countries": ["fr"],
+    "groups": [
+      {"title": "Canal+", "match": ["canal+", "canalplus", "canal plus"]},
+      {"title": "Jeunesse", "match": ["kids", "junior", "disney", "nickelodeon", "nick ", "nickjr", "boomerang", "cartoon", "piwi", "tiji", "canal j", "tfou", "baby", "boing", "toonami", "teletoon", "mangas", "game one", "ludikids"]},
+      {"title": "Sport", "match": ["sport", "bein", "eurosport", "golf", "automoto", "foot", "dazn", "ligue 1", "tennis", "equidia", "olympia", "combat", "fight", "rmc sport", "infosport", "extreme"]},
+      {"title": "Info", "match": ["info", "news", "bfm", "france 24", "france24", "euronews", "tv5", "i24", "lcp", "public senat", "franceinfo", "rt france", "cnbc", "bloomberg"]},
+      {"title": "Documentaires", "match": ["doc", "planete", "national geographic", "nat geo", "natgeo", "discovery", "histoire", "history", "ushuaia", "science", "animaux", "animal", "trek", "chasse", "peche", "seasons", "voyage", "museum", "crime district", "investigation", "explore", "nature"]},
+      {"title": "Musique", "match": ["music", "musique", "mtv", "mcm", "trace", "melody", "nrj hits", "clubbing", "mezzo", "stingray", "rfm tv", "bblack", "m6 music", "virgin radio", "funradio", "radio"]},
+      {"title": "Cinéma", "match": ["cine", "cinema", "film", "ocs", "paramount", "tcm", "action", "polar", "warner tv", "studiocanal", "frissons", "emotion", "classic", "star"]},
+      {"title": "Séries et divertissement", "match": ["serie", "comedie", "comedy", "teva", "rtl9", "ab1", "13e rue", "13eme rue", "syfy", "warner", "j-one", "jone", "nrj12", "c8", "e!", "novelas", "series", "tv breizh", "paramount network", "chérie", "gameone", "game one"]},
+      {"title": "Régions", "match": ["france 3 ", "france3 ", "via ", "tvr", "tl7", "bfm paris", "bfm lyon", "bfm marseille", "lyon", "paris", "alsace", "bretagne", "normandie", "corse", "provence", "occitanie", "grand", "tebeo", "tv7", "8 mont blanc", "8montblanc"]},
+      {"title": "Autres chaînes françaises", "match": [""]}
+    ]
+  },
+  "after_themes": [
+    {
+      "id": "suisse", "title": "Suisse romande", "countries": ["ch", "fr", "other"],
+      "channels": [
+        {"name": "RTS 1", "keys": ["rts1", "rtsun", "tsr1"]},
+        {"name": "RTS 2", "keys": ["rts2", "rtsdeux", "tsr2"]},
+        {"name": "RTS Info", "keys": ["rtsinfo"]},
+        {"name": "Rouge TV", "keys": ["rougetv", "rouge"]},
+        {"name": "One TV", "keys": ["onetv", "one"]},
+        {"name": "TVM3", "keys": ["tvm3"]},
+        {"name": "Blue Sport", "keys": ["bluesport*", "bluezoom"]},
+        {"name": "MySports", "keys": ["mysports*"]},
+        {"name": "Léman Bleu", "keys": ["lemanbleu"]},
+        {"name": "La Télé", "keys": ["latele", "latelevaudfribourg"]},
+        {"name": "Canal 9", "keys": ["canal9"]},
+        {"name": "Canal Alpha", "keys": ["canalalpha"]},
+        {"name": "TeleBielingue", "keys": ["telebielingue"]},
+        {"name": "Carac TV", "keys": ["caractv", "carac", "carac1"]}
+      ]
+    },
+    {
+      "id": "uk", "title": "Royaume-Uni", "countries": ["uk", "us"],
+      "channels": [
+        {"name": "BBC One", "keys": ["bbcone", "bbc1", "bbconelondon", "bbconehd"]},
+        {"name": "BBC Two", "keys": ["bbctwo", "bbc2"]},
+        {"name": "ITV1", "keys": ["itv1", "itv", "itvlondon"]},
+        {"name": "Channel 4", "keys": ["channel4", "c4"]},
+        {"name": "Channel 5", "keys": ["channel5", "five", "5"]},
+        {"name": "BBC News", "keys": ["bbcnews", "bbcworldnews"]},
+        {"name": "Sky News", "keys": ["skynews"]}
+      ]
+    },
+    {
+      "id": "us", "title": "États-Unis", "countries": ["us", "uk"],
+      "channels": [
+        {"name": "ABC", "keys": ["abc", "abcus", "abceast", "abcusa", "abcnewyork", "wabc"]},
+        {"name": "CBS", "keys": ["cbs", "cbsus", "cbseast", "cbsusa", "cbsnewyork", "wcbs"]},
+        {"name": "NBC", "keys": ["nbc", "nbcus", "nbceast", "nbcusa", "nbcnewyork", "wnbc"]},
+        {"name": "FOX", "keys": ["fox", "foxus", "foxeast", "foxusa", "foxnewyork", "wnyw"]},
+        {"name": "CNN", "keys": ["cnn", "cnnus", "cnnusa", "cnninternational"]}
+      ]
+    }
+  ],
+  "sources": {
+    "comment": "Flux des serveurs Xtream d'abord ; une liste dont le nom ou l'adresse contient « netplus » sert seulement de repli pour les chaînes de la grille.",
+    "fallback": ["netplus"]
+  }
+}
