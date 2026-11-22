@@ -22,7 +22,7 @@ import collections, hashlib, io, json, math, os, re, shutil, socket, struct, sub
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -2690,10 +2690,10 @@ TV_DIR = "/opt/tvlibre-tv"
 TV_LOG = "/var/log/tvlibre-tv-install.log"
 TV_REPO = "https://codeload.github.com/Agly00/tvlibre/tar.gz/refs/heads/main"
 TV_DEPS_VERSION = "2"           # change → dépendances réinstallées
-TV_PYSIDE = "PySide6-Essentials==6.7.3"     # dernière version compatible Bookworm (glibc 2.36) en aarch64
+TV_PYSIDE = "PySide6-Essentials"     # pip choisit la plus récente compatible (Bookworm : ≤ 6.7 ; Trixie : 6.8 et plus)
 TV_APT = ["libmpv2", "python3-venv", "cec-utils", "v4l-utils", "libegl1", "libgles2", "libgbm1", "libdrm2",
           "libxkbcommon0", "libfontconfig1", "libfreetype6", "libdbus-1-3", "libglib2.0-0", "libinput10",
-          "libmtdev1", "libts0", "fonts-inter", "fonts-dejavu-core"]
+          "libmtdev1", "libts0", "libts0t64", "libglib2.0-0t64", "fonts-inter", "fonts-dejavu-core"]
 
 TV_UNIT = """[Unit]
 Description=TV Libre sur la télé (HDMI)
