@@ -18,11 +18,11 @@ Le Raspberry joint le serveur IPTV à travers NordVPN et sert à l'iPhone et à 
 Une seule lecture à la fois vers le serveur (abonnement limité à une connexion).
 Bibliothèque standard Python uniquement, plus ffmpeg.
 """
-import collections, json, math, os, re, shutil, socket, struct, subprocess, sys, threading, time, uuid
+import collections, hashlib, io, json, math, os, re, shutil, socket, struct, subprocess, sys, tarfile, threading, time, uuid
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.7.3"
+VERSION = "1.8.0"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -2679,6 +2679,300 @@ def updater():
             subprocess.run(["systemctl", "start", "--no-block", "tvlibre-update.service"], capture_output=True, timeout=20)
 
 
+# ---------------------------------------------------------------- télé en HDMI : installation, mises à jour, Wi-Fi
+#
+# Le relais installe lui-même l'interface télé (dossier tv/ du dépôt) dans /opt/tvlibre-tv, la tient à jour
+# (vérification toutes les heures, jamais pendant une lecture) et la lance au démarrage. Cohabitation avec
+# d'autres projets sur le Raspberry (Pi-hole…) : aucun port partagé (relais 8090, télécommande 8091), services
+# séparés, mémoire bornée, priorité à la lecture télé, aucun réglage DNS ou réseau du système modifié.
+
+TV_DIR = "/opt/tvlibre-tv"
+TV_LOG = "/var/log/tvlibre-tv-install.log"
+TV_REPO = "https://codeload.github.com/Agly00/tvlibre/tar.gz/refs/heads/main"
+TV_DEPS_VERSION = "2"           # change → dépendances réinstallées
+TV_PYSIDE = "PySide6-Essentials==6.7.3"     # dernière version compatible Bookworm (glibc 2.36) en aarch64
+TV_APT = ["libmpv2", "python3-venv", "cec-utils", "v4l-utils", "libegl1", "libgles2", "libgbm1", "libdrm2",
+          "libxkbcommon0", "libfontconfig1", "libfreetype6", "libdbus-1-3", "libglib2.0-0", "libinput10",
+          "libmtdev1", "libts0", "fonts-inter", "fonts-dejavu-core"]
+
+TV_UNIT = """[Unit]
+Description=TV Libre sur la télé (HDMI)
+After=network-online.target tvlibre-relay.service
+Wants=network-online.target
+
+[Service]
+Environment=QT_QPA_PLATFORM=eglfs
+Environment=QT_QPA_EGLFS_INTEGRATION=eglfs_kms
+Environment=QT_QPA_EGLFS_KMS_CONFIG=/etc/tvlibre/eglfs.json
+Environment=QT_QPA_EGLFS_HIDECURSOR=1
+Environment=QT_QPA_EGLFS_KMS_ATOMIC=1
+Environment=QT_QPA_EGLFS_ALWAYS_SET_MODE=1
+Environment=HOME=/root
+# La télécommande de la télé (HDMI-CEC) : le Raspberry se déclare lecteur, la télé lui transmet les touches
+ExecStartPre=-/usr/bin/cec-ctl -d /dev/cec0 --playback -S
+ExecStart=/opt/tvlibre-tv/venv/bin/python /opt/tvlibre-tv/tvlibre_tv.py
+Restart=always
+RestartSec=5
+# Priorité à l'image et au son sur les autres projets du Raspberry ; mémoire bornée
+Nice=-5
+CPUWeight=400
+IOWeight=400
+MemoryMax=2500M
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def _mask(t):
+    """Journaux montrés hors du Raspberry : jamais d'identifiant ni de mot de passe IPTV"""
+    t = re.sub(r"/(live|movie|series|timeshift)/[^/\s]+/[^/\s]+/", r"/\1/***/***/", t)
+    return re.sub(r"(username|password|token)=[^&\s\"']+", r"\1=***", t)
+
+
+class TvInstaller:
+    def __init__(self):
+        self.step = "en attente"
+        self.error = None
+        self.running = False
+        self.installed = None
+        self.lock = threading.Lock()
+
+    def note(self, msg):
+        self.step = msg
+        log("télé :", msg)
+        try:
+            with open(TV_LOG, "a") as f:
+                f.write(time.strftime("%F %T ") + msg + "\n")
+        except OSError:
+            pass
+
+    def run(self, cmd, timeout=1800):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
+        if r.returncode != 0:
+            raise RuntimeError("%s : %s" % (" ".join(cmd[:3]), (r.stderr or r.stdout)[-300:].strip()))
+        return r.stdout
+
+    def describe(self):
+        tail = []
+        try:
+            tail = open(TV_LOG).read().splitlines()[-25:]
+        except OSError:
+            pass
+        return {"step": self.step, "error": self.error, "running": self.running,
+                "installed": self.installed or self._read_marker("version"),
+                "service": sh(["systemctl", "is-active", "tvlibre-tv.service"]),
+                "enabled": sh(["systemctl", "is-enabled", "tvlibre-tv.service"]),
+                "hdmi": self.hdmi_status(), "wifi": wifi_status(), "log": tail}
+
+    @staticmethod
+    def _read_marker(name):
+        try:
+            return open(os.path.join(TV_DIR, "." + name)).read().strip()
+        except OSError:
+            return None
+
+    @staticmethod
+    def hdmi_status():
+        out = {}
+        for d in sorted(os.listdir("/sys/class/drm")) if os.path.isdir("/sys/class/drm") else []:
+            if "HDMI" in d:
+                try:
+                    out[d] = open("/sys/class/drm/%s/status" % d).read().strip()
+                except OSError:
+                    pass
+        return out
+
+    def loop(self):
+        time.sleep(30)
+        while True:
+            self.check()
+            time.sleep(3600)
+
+    def check(self, force=False):
+        with self.lock:
+            if self.running:
+                return
+            self.running = True
+        try:
+            self._check(force)
+            self.error = None
+        except Exception as e:
+            self.error = str(e)[:300]
+            self.note("échec : " + self.error)
+        finally:
+            self.running = False
+
+    def _check(self, force):
+        data = urllib.request.urlopen(TV_REPO, timeout=180).read()
+        files = {}
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            for m in tar.getmembers():
+                parts = m.name.split("/", 2)
+                if not m.isfile() or len(parts) < 3 or parts[1] != "tv":
+                    continue
+                rel = parts[2]
+                if ".." in rel.split("/") or rel.startswith("/") or rel.startswith("shots/") or "__pycache__" in rel:
+                    continue
+                files[rel] = tar.extractfile(m).read()
+        if "tvlibre_tv.py" not in files:
+            raise RuntimeError("dossier tv/ introuvable dans le dépôt")
+        digest = hashlib.sha256(b"".join(k.encode() + b"\0" + files[k] for k in sorted(files))).hexdigest()[:12]
+        deps_ok = self._read_marker("deps") == TV_DEPS_VERSION and os.path.exists(TV_DIR + "/venv/bin/python")
+        if not force and deps_ok and self._read_marker("version") == digest:
+            self.installed = digest
+            self.ensure_service(start=False)
+            self.step = "à jour (%s)" % digest
+            return
+        if not deps_ok:
+            self.install_deps()
+        # Copie (dossier neuf puis échange : jamais de fichiers à moitié écrits)
+        new = TV_DIR + "/.new"
+        shutil.rmtree(new, ignore_errors=True)
+        for rel, b in files.items():
+            dst = os.path.join(new, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as f:
+                f.write(b)
+        for rel in list(files) + ["qml"]:
+            top = rel.split("/")[0]
+            src, dst = os.path.join(new, top), os.path.join(TV_DIR, top)
+            if not os.path.exists(src):
+                continue
+            if os.path.isdir(dst):
+                shutil.rmtree(dst)
+            elif os.path.exists(dst):
+                os.remove(dst)
+            shutil.move(src, dst)
+        shutil.rmtree(new, ignore_errors=True)
+        with open(TV_DIR + "/.version", "w") as f:
+            f.write(digest)
+        self.installed = digest
+        self.note("interface télé copiée (%s)" % digest)
+        self.ensure_service(start=True)
+
+    def install_deps(self):
+        self.note("installation des paquets (10 à 20 min la première fois)")
+        os.makedirs(TV_DIR, exist_ok=True)
+        self.run(["apt-get", "update"], timeout=900)
+        missing = []
+        for pkg in TV_APT:
+            try:
+                self.run(["apt-get", "install", "-y", "--no-install-recommends", pkg], timeout=900)
+            except Exception:
+                missing.append(pkg)
+        if missing:
+            self.note("paquets absents (sans gravité s'il s'agit de polices) : " + ", ".join(missing))
+        if not os.path.exists(TV_DIR + "/venv/bin/python"):
+            self.run(["python3", "-m", "venv", TV_DIR + "/venv"], timeout=300)
+        self.note("installation de Qt et de mpv pour Python")
+        self.run([TV_DIR + "/venv/bin/pip", "install", "--no-cache-dir", "--upgrade", "pip"], timeout=600)
+        self.run([TV_DIR + "/venv/bin/pip", "install", "--no-cache-dir", TV_PYSIDE, "python-mpv"], timeout=2400)
+        with open(TV_DIR + "/.deps", "w") as f:
+            f.write(TV_DEPS_VERSION)
+        self.note("paquets installés")
+
+    def ensure_service(self, start):
+        changed = False
+        os.makedirs("/etc/tvlibre", exist_ok=True)
+        if not os.path.exists("/etc/tvlibre/tv.json"):
+            fd = os.open("/etc/tvlibre/tv.json", os.O_WRONLY | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"server": "", "username": "", "password": ""}, f)
+        self.write_eglfs()
+        self.force_hdmi()
+        unit = "/etc/systemd/system/tvlibre-tv.service"
+        cur = open(unit).read() if os.path.exists(unit) else None
+        if cur != TV_UNIT:
+            with open(unit, "w") as f:
+                f.write(TV_UNIT)
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=60)
+            changed = True
+        if sh(["systemctl", "is-enabled", "tvlibre-tv.service"]) != "enabled":
+            subprocess.run(["systemctl", "enable", "tvlibre-tv.service"], capture_output=True, timeout=60)
+            self.note("lancement au démarrage activé")
+        playing = time.time() < Sessions.remote_busy_until
+        if (start or changed) and not playing:
+            subprocess.run(["systemctl", "restart", "tvlibre-tv.service"], capture_output=True, timeout=60)
+            self.note("interface télé (re)lancée")
+        elif sh(["systemctl", "is-active", "tvlibre-tv.service"]) != "active" and not playing:
+            subprocess.run(["systemctl", "start", "tvlibre-tv.service"], capture_output=True, timeout=60)
+
+    @staticmethod
+    def write_eglfs():
+        """Carte graphique qui porte la prise HDMI (sur le Raspberry 4, pas toujours card0)"""
+        card = None
+        if os.path.isdir("/sys/class/drm"):
+            for d in sorted(os.listdir("/sys/class/drm")):
+                m = re.match(r"(card\d+)-HDMI-A-1$", d)
+                if m:
+                    card = m.group(1)
+                    break
+        cfg = {"device": "/dev/dri/%s" % (card or "card1"), "hwcursor": False,
+               "outputs": [{"name": "HDMI1", "mode": "1920x1080"}]}
+        txt = json.dumps(cfg, indent=1)
+        p = "/etc/tvlibre/eglfs.json"
+        if not os.path.exists(p) or open(p).read() != txt:
+            with open(p, "w") as f:
+                f.write(txt)
+
+    def force_hdmi(self):
+        """Sortie HDMI en 1080p même si la télé n'est pas branchée au démarrage (sinon l'écran reste noir
+        quand on la branche ensuite). Pris en compte au prochain redémarrage."""
+        for p in ("/boot/firmware/cmdline.txt", "/boot/cmdline.txt"):
+            if not os.path.exists(p):
+                continue
+            line = open(p).read().strip()
+            if "video=HDMI-A-1" not in line:
+                shutil.copy(p, p + ".avant-tvlibre")
+                with open(p, "w") as f:
+                    f.write(line + " video=HDMI-A-1:1920x1080@60D\n")
+                self.note("sortie HDMI 1080p forcée (au prochain redémarrage)")
+            return
+
+
+TV_INSTALL = TvInstaller()
+
+
+def wifi_status():
+    out = {"radio": sh(["nmcli", "radio", "wifi"]), "ip": None, "ssid": None}
+    for l in sh(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"]).splitlines():
+        if l.startswith("yes:"):
+            out["ssid"] = l[4:]
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", sh(["ip", "-4", "addr", "show", "wlan0"]))
+    out["ip"] = m.group(1) if m else None
+    return out
+
+
+def wifi_connect(ssid, password):
+    """Wi-Fi du Raspberry : pays CH, puce débloquée, connexion gardée ; l'Ethernet reste prioritaire s'il est branché.
+    Le mot de passe n'est jamais écrit dans un journal."""
+    steps = []
+    subprocess.run(["rfkill", "unblock", "wifi"], capture_output=True, timeout=10)
+    if shutil.which("raspi-config"):
+        subprocess.run(["raspi-config", "nonint", "do_wifi_country", "CH"], capture_output=True, timeout=30)
+    else:
+        subprocess.run(["iw", "reg", "set", "CH"], capture_output=True, timeout=10)
+    if not shutil.which("nmcli"):
+        return {"ok": False, "error": "NetworkManager absent (Raspberry Pi OS antérieur à Bookworm)"}
+    subprocess.run(["nmcli", "radio", "wifi", "on"], capture_output=True, timeout=10)
+    subprocess.run(["nmcli", "connection", "delete", "tvlibre-wifi"], capture_output=True, timeout=10)
+    subprocess.run(["nmcli", "device", "wifi", "rescan"], capture_output=True, timeout=15)
+    time.sleep(4)
+    r = subprocess.run(["nmcli", "connection", "add", "type", "wifi", "ifname", "wlan0", "con-name", "tvlibre-wifi",
+                        "ssid", ssid, "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password,
+                        "connection.autoconnect", "yes", "ipv4.route-metric", "600", "ipv6.route-metric", "600"],
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        return {"ok": False, "error": (r.stderr or r.stdout).strip()[-200:]}
+    r = subprocess.run(["nmcli", "connection", "up", "tvlibre-wifi"], capture_output=True, text=True, timeout=60)
+    st = wifi_status()
+    ok = r.returncode == 0 and st["ip"] is not None
+    log("Wi-Fi :", "connecté à %s (%s)" % (st["ssid"], st["ip"]) if ok else "échec")
+    return {"ok": ok, **st, **({} if ok else {"error": (r.stderr or r.stdout).strip()[-200:]})}
+
+
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
@@ -2707,10 +3001,21 @@ class Handler(BaseHTTPRequestHandler):
         """Compte IPTV de la télé (Raspberry branché en HDMI), envoyé par l'iPhone à la maison"""
         u = urllib.parse.urlparse(self.path)
         ip = self.client_address[0]
-        if u.path not in ("/tv/config", "/tv/grille"):
+        if u.path not in ("/tv/config", "/tv/grille", "/wifi", "/tv/install"):
             return self.send(404, b"introuvable")
         if not (ip.startswith("192.168.") or ip.startswith("172.") or (ip.startswith("10.") and not ip.startswith("10.66."))):
             return self.js({"error": "seulement depuis le réseau de la maison"}, 403)
+        if u.path == "/wifi":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                d = json.loads(self.rfile.read(min(n, 4000)) or b"{}")
+                ssid, pw = str(d["ssid"])[:64], str(d["password"])[:128]
+            except Exception:
+                return self.js({"error": "il faut ssid et password"}, 400)
+            return self.js(wifi_connect(ssid, pw))
+        if u.path == "/tv/install":
+            threading.Thread(target=TV_INSTALL.check, kwargs={"force": True}, daemon=True).start()
+            return self.js({"ok": True, "message": "installation de l'interface télé relancée"})
         if u.path == "/tv/grille":
             # Chaînes retirées de la grille sur l'iPhone : la télé applique le même choix
             try:
@@ -2818,6 +3123,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not WG.ok:
                     return self.js({"error": WG.error or "WireGuard pas encore prêt"}, 503)
                 return self.js({"config": WG.client_config(), **WG.describe()})
+            if u.path == "/tv/install":
+                return self.js(TV_INSTALL.describe())
+            if u.path == "/tv/log":
+                ip = self.client_address[0]
+                if not (ip.startswith("192.168.") or ip.startswith("172.") or (ip.startswith("10.") and not ip.startswith("10.66."))):
+                    return self.js({"error": "seulement depuis le réseau de la maison"}, 403)
+                txt = sh(["journalctl", "-u", "tvlibre-tv.service", "-n", "150", "--no-pager", "-o", "short-iso"], timeout=15)
+                return self.send(200, _mask(txt).encode())
             if u.path == "/busy":
                 Sessions.remote_busy_until = time.time() + 90
                 return self.js({"ok": True})
@@ -3170,6 +3483,7 @@ def main():
     threading.Thread(target=RECORDER.loop, daemon=True).start()
     threading.Thread(target=WG.loop, daemon=True).start()
     threading.Thread(target=updater, daemon=True).start()
+    threading.Thread(target=TV_INSTALL.loop, daemon=True).start()
     srv = Server(("0.0.0.0", PORT), Handler)
     log("TV Libre relais %s sur le port %d" % (VERSION, PORT))
     srv.serve_forever()
