@@ -22,7 +22,7 @@ import collections, hashlib, io, json, math, os, re, shutil, socket, struct, sub
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -2689,11 +2689,13 @@ def updater():
 TV_DIR = "/opt/tvlibre-tv"
 TV_LOG = "/var/log/tvlibre-tv-install.log"
 TV_REPO = "https://codeload.github.com/Agly00/tvlibre/tar.gz/refs/heads/main"
-TV_DEPS_VERSION = "2"           # change → dépendances réinstallées
+TV_DEPS_VERSION = "3"           # change → dépendances réinstallées
 TV_PYSIDE = "PySide6-Essentials"     # pip choisit la plus récente compatible (Bookworm : ≤ 6.7 ; Trixie : 6.8 et plus)
 TV_APT = ["libmpv2", "python3-venv", "cec-utils", "v4l-utils", "libegl1", "libgles2", "libgbm1", "libdrm2",
           "libxkbcommon0", "libfontconfig1", "libfreetype6", "libdbus-1-3", "libglib2.0-0", "libinput10",
-          "libmtdev1", "libts0", "libts0t64", "libglib2.0-0t64", "fonts-inter", "fonts-dejavu-core"]
+          "libmtdev1", "libts0", "libts0t64", "libglib2.0-0t64", "fonts-inter", "fonts-dejavu-core",
+          # pilotes graphiques Mesa (sans eux : « Could not initialize egl display »)
+          "libegl-mesa0", "libgl1-mesa-dri", "mesa-libgallium", "libgbm1", "libdrm-common"]
 
 TV_UNIT = """[Unit]
 Description=TV Libre sur la télé (HDMI)
@@ -2869,9 +2871,21 @@ class TvInstaller:
         self.note("installation de Qt et de mpv pour Python")
         self.run([TV_DIR + "/venv/bin/pip", "install", "--no-cache-dir", "--upgrade", "pip"], timeout=600)
         self.run([TV_DIR + "/venv/bin/pip", "install", "--no-cache-dir", TV_PYSIDE, "python-mpv"], timeout=2400)
+        self.check_libs()
         with open(TV_DIR + "/.deps", "w") as f:
             f.write(TV_DEPS_VERSION)
         self.note("paquets installés")
+
+    def check_libs(self):
+        """Bibliothèques manquantes pour l'affichage plein écran de Qt (noté dans le journal d'installation)"""
+        import glob
+        miss = set()
+        for so in glob.glob(TV_DIR + "/venv/lib/python3*/site-packages/PySide6/Qt/plugins/egldeviceintegrations/libqeglfs-kms-integration.so") + \
+                  glob.glob(TV_DIR + "/venv/lib/python3*/site-packages/PySide6/Qt/plugins/platforms/libqeglfs.so"):
+            for l in sh(["ldd", so], timeout=20).splitlines():
+                if "not found" in l:
+                    miss.add(l.split()[0])
+        self.note("bibliothèques manquantes pour l'écran : " + ", ".join(sorted(miss)) if miss else "bibliothèques de l'écran : toutes présentes")
 
     def ensure_service(self, start):
         changed = False
