@@ -22,7 +22,7 @@ import collections, hashlib, io, json, math, os, re, shutil, socket, struct, sub
 import urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-VERSION = "1.8.2"
+VERSION = "1.9.0"
 PORT = int(os.environ.get("TVLIBRE_PORT", "8090"))
 RUN = os.environ.get("TVLIBRE_RUN", "/run/tvlibre")
 UA = "VLC/3.0.21 LibVLC/3.0.21"
@@ -2949,6 +2949,102 @@ class TvInstaller:
 TV_INSTALL = TvInstaller()
 
 
+# ---------------------------------------------------------------- grille pour VLC sur l'Apple TV (sans câble HDMI)
+# L'Apple TV refuse les adresses envoyées par le Pi en AirPlay (tvOS 26). À la place, l'app VLC de l'Apple TV
+# ouvre http://tvlibre.local:8090/tv.m3u : la grille de la télé, chaque chaîne pointant vers le relais
+# (/ch/<clé>.m3u8), qui ouvre le direct par le VPN du Pi et renvoie vers son HLS. Aucun mot de passe dans la liste.
+
+class VlcLineup:
+    TTL = 900
+    HEAVY = re.compile(r"4k|uhd|hevc|h\.?265|2160|ᵁᴴᴰ", re.I)
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.at = 0
+        self.items = []            # [(clé, section, nom, logo, [urls])]
+        self.by_key = {}
+        self.current = (None, None)   # (clé, session)
+
+    def _lineup(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("tv_lineup", os.path.join(TV_DIR, "lineup.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _json(url):
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8", "replace") or "null")
+
+    def _build(self):
+        cfg = json.load(open("/etc/tvlibre/tv.json"))
+        srv, user, pw = cfg["server"].rstrip("/"), cfg["username"], cfg["password"]
+        if not user:
+            raise RuntimeError("compte de la télé absent : « Envoyer le compte à la télé » depuis l'iPhone")
+        lu = self._lineup()
+        base = "%s/player_api.php?%s" % (srv, urllib.parse.urlencode({"username": user, "password": pw}))
+        cats = {str(c["category_id"]): c.get("category_name") or "" for c in (self._json(base + "&action=get_live_categories") or [])}
+        flat = []
+        for st in self._json(base + "&action=get_live_streams") or []:
+            name = st.get("name") or ""
+            cat = cats.get(str(st.get("category_id")), "")
+            flat.append({"name": name, "group": cat, "country": lu.country_of(cat, name), "xtream": True,
+                         "url": "%s/live/%s/%s/%s.ts" % (srv, user, pw, st.get("stream_id")), "logo": st.get("stream_icon") or ""})
+        for u in cfg.get("fallback") or []:            # Netplus : seulement en secours
+            try:
+                txt = urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": UA}), timeout=25).read().decode("utf-8", "replace")
+            except Exception:
+                continue
+            info = None
+            for line in txt.splitlines():
+                line = line.strip()
+                if line.startswith("#EXTINF"):
+                    info = line
+                elif line and not line.startswith("#") and info:
+                    attrs = dict(re.findall(r'([A-Za-z0-9\-]+)="([^"]*)"', info))
+                    name = info.rsplit(",", 1)[-1].strip()
+                    flat.append({"name": name, "group": attrs.get("group-title", ""), "xtream": False, "url": line,
+                                 "country": lu.country_of(attrs.get("group-title", ""), name), "logo": attrs.get("tvg-logo", "")})
+                    info = None
+        try:
+            g = json.load(open("/etc/tvlibre/grille.json"))
+        except Exception:
+            g = {}
+        secs = lu.build(flat, set(g.get("excluded") or []), g.get("moved") or {}, g.get("merged") or {})
+        items, by_key = [], {}
+        for _sid, title, chans in secs:
+            for c in chans:
+                streams = [x for x in c["streams"] if x.get("url")]
+                # 1080p au plus : les flux 4K/HEVC passent en dernier (l'Apple TV HD ne les lit pas bien)
+                streams.sort(key=lambda x: (0 if x.get("xtream") else 1, 1 if self.HEAVY.search(x["name"]) else 0))
+                if not streams:
+                    continue
+                k = hashlib.sha1(c["gid"].encode()).hexdigest()[:10]
+                items.append((k, title, c["name"], c.get("logo") or "", [x["url"] for x in streams]))
+                by_key[k] = items[-1]
+        return items, by_key
+
+    def refresh(self, force=False):
+        with self.lock:
+            if force or not self.items or time.time() - self.at > self.TTL:
+                self.items, self.by_key = self._build()
+                self.at = time.time()
+                log("grille VLC : %d chaînes" % len(self.items))
+            return self.items
+
+    def m3u(self, host):
+        out = ["#EXTM3U"]
+        for k, sec, name, logo, _ in self.refresh():
+            out.append('#EXTINF:-1 tvg-logo="%s" group-title="%s",%s' % (logo.replace('"', ""), sec.replace('"', ""), name))
+            out.append("http://%s/ch/%s.m3u8" % (host, k))
+        return ("\n".join(out) + "\n").encode()
+
+
+VLC = VlcLineup()
+
+
 def wifi_status():
     out = {"radio": sh(["nmcli", "radio", "wifi"]), "ip": None, "ssid": None}
     for l in sh(["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"]).splitlines():
@@ -3077,6 +3173,13 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
         try:
+            if u.path == "/tv.m3u":
+                if not self.lan():
+                    return self.js({"error": "seulement depuis le réseau de la maison"}, 403)
+                return self.send(200, VLC.m3u(self.headers.get("Host") or "tvlibre.local:8090"), "audio/x-mpegurl", head=head)
+            m = re.fullmatch(r"/ch/([0-9a-f]{10})\.m3u8", u.path)
+            if m:
+                return self.vlc_channel(m.group(1))
             if u.path == "/status":
                 return self.js(status())
             if u.path == "/api":
@@ -3178,6 +3281,43 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             log("erreur", u.path, e)
             self.js({"error": str(e)}, 502)
+
+    def lan(self):
+        ip = self.client_address[0]
+        return ip.startswith("192.168.") or ip.startswith("172.") or ip.startswith("127.") or (ip.startswith("10.") and not ip.startswith("10.66."))
+
+    def vlc_channel(self, k):
+        """Chaîne choisie dans VLC (Apple TV) : direct ouvert par le Pi, puis renvoi vers son HLS.
+        VLC redemande cette adresse en cours de lecture : on garde la session déjà ouverte pour la même chaîne."""
+        if not self.lan():
+            return self.js({"error": "seulement depuis le réseau de la maison"}, 403)
+        host = self.headers.get("Host") or "tvlibre.local:8090"
+        ck, csid = VLC.current
+        if ck == k and SESSIONS.get(csid or "") is not None:
+            return self.send(302, b"", extra={"Location": "http://%s/s/%s/live.m3u8" % (host, csid)})
+        it = VLC.by_key.get(k)
+        if not it:
+            VLC.refresh(force=True)
+            it = VLC.by_key.get(k)
+        if not it:
+            return self.send(404, b"chaine inconnue")
+        if self.recording_conflict():
+            return
+        for url in it[4][:3]:
+            self.note_upstream(url)
+            STATS.reset("direct pour VLC sur l'Apple TV")
+            sid, s = SESSIONS.open("live", lambda sid: LiveSession(sid, url))
+            t = time.time()
+            while time.time() - t < 15 and not s.ready():
+                time.sleep(0.3)
+            if s.ready():
+                VLC.current = (k, sid)
+                log("VLC :", it[2], "prêt en %.1f s" % (time.time() - t))
+                return self.send(302, b"", extra={"Location": "http://%s/s/%s/live.m3u8" % (host, sid)})
+            log("VLC :", it[2], "ce flux ne démarre pas, essai du suivant")
+            SESSIONS.close(sid)
+        VLC.current = (None, None)
+        return self.js({"error": "le direct ne démarre pas"}, 504)
 
     def probe(self, url):
         """Replay : le serveur donne-t-il la taille et accepte-t-il les plages ? (lecture façon film)"""
